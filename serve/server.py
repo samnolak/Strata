@@ -27,6 +27,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+from array import array
 import contextlib
 import collections
 import base64
@@ -351,6 +352,33 @@ COALESCE_WAIT_MS = max(0, int(os.environ.get("STRATA_COALESCE_WAIT_MS") or 0))  
 # longer pass only cost (measured 4 x 1 replicas at 8 requests: 168 against 196 tok/s with an unconditional wait).
 COALESCE_MIN_REQS = max(2, int(os.environ.get("STRATA_COALESCE_MIN_REQS") or 3))
 COALESCE_BURST_MS = max(10, int(os.environ.get("STRATA_COALESCE_BURST_MS") or 250))
+# --batch, a swarm of agents (opt-in, both off by default: nothing below changes then).
+# STRATA_ADMIT_UNCACHED=1: STRATA_ADMIT_SHORT_FIRST and the give-way rule (BYIELD, #656) measure a prompt by what the
+# engine will READ of it - its length minus the longest start of it a cache holds - not by its whole length.  An agent
+# that comes back with 100K tokens cached and 600 new ones is a short read, not a long one waiting behind a cold 30K
+# prompt.  The caches are the idle slots' held tokens (exact) and a mirror of the last streams this server finished (the
+# engine's main session and its conversation cache: STRATA_ADMIT_MIRROR entries, default --batch + the conversation
+# cache's slots + 1), corrected by the engine's own reused count: an entry that promised more than the engine reused is
+# dropped.  Only the order changes, never what is read.
+ADMIT_UNCACHED = (os.environ.get("STRATA_ADMIT_UNCACHED") or "0").strip() not in ("", "0")
+try:
+    ADMIT_MIRROR = max(0, int(os.environ.get("STRATA_ADMIT_MIRROR") or 0))      # 0: from the engine's args
+except ValueError:
+    ADMIT_MIRROR = 0
+ADMIT_MIRROR_TOKENS = 4_000_000     # the mirror's whole size (int32 arrays: 16 MB at most)
+ADMIT_MISS_SLACK = 256              # reused this much below the estimate still counts as a hit (a re-read last token, ..)
+# STRATA_SLOT_AFFINITY=1: which idle slot a request that matches none overwrites.  Before: an empty one, else the one
+# used longest ago.  With it: first a slot whose conversation is worth nothing to keep - empty, shorter than
+# STRATA_SLOT_KEEP_MIN tokens (default 4096: Claude Code's title / classifier side requests), or held again by another
+# idle slot that continues it - and last a slot that holds the start of a prompt still waiting for one (its agent comes
+# back to it).  On pipelined groups of several slots the same order breaks ties between the groups with the fewest busy
+# slots (a slot taken there also costs the idle slots below it their conversations, #793).
+SLOT_AFFINITY = (os.environ.get("STRATA_SLOT_AFFINITY") or "0").strip() not in ("", "0")
+try:
+    SLOT_KEEP_MIN = max(0, int(os.environ.get("STRATA_SLOT_KEEP_MIN") or 4096))
+except ValueError:
+    SLOT_KEEP_MIN = 4096
+_MIRROR_LOCK = threading.Lock()
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
 
@@ -1253,6 +1281,13 @@ class StrataEngine:
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
+        # STRATA_ADMIT_UNCACHED: the mirror of the streams this engine process holds (a new process holds none)
+        self._mirror, self._mirror_cap, self._mirror_min = [], *self._mirror_limits(args)
+        self.swarm_stats = {"estimates": 0, "est_hit_tokens": 0, "reused_tokens": 0, "overestimates": 0,
+                            "mirror_dropped": 0}
+        if self.batch and (ADMIT_UNCACHED or SLOT_AFFINITY):
+            print(f"[strata] swarm serving: admission by uncached length {'on' if ADMIT_UNCACHED else 'off'} "
+                  f"(mirror {self._mirror_cap} streams), slot affinity {'on' if SLOT_AFFINITY else 'off'}", flush=True)
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
@@ -2008,7 +2043,8 @@ class StrataEngine:
         """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
         next - one whose prompt is at most that long (it reads little) before a longer one, in arrival order within
         each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
-        Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read."""
+        Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read.
+        (With STRATA_ADMIT_UNCACHED the lengths are what the engine will read: the prompt minus its cached start.)"""
         now = time.monotonic()
         ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
         if not ordered:
@@ -2030,9 +2066,175 @@ class StrataEngine:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
 
     def _shorter_waiting(self, plen: int) -> bool:
-        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
+        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to.
+        (With STRATA_ADMIT_UNCACHED both lengths are the uncached ones: generate_batched passes them.)"""
         with self.slot_cv:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
+
+    # --- swarm serving (STRATA_ADMIT_UNCACHED, STRATA_SLOT_AFFINITY; both opt-in) ---
+
+    @staticmethod
+    def _mirror_limits(args) -> tuple[int, int]:
+        """STRATA_ADMIT_UNCACHED: how many finished streams the engine's caches can hold (the mirror's size: the
+        slots, the conversation cache's parked ones and the main session) and the shortest one worth noting (the
+        conversation cache parks none shorter than --conversation-cache-min-tokens; a few hundred tokens of hit do not
+        change an order)."""
+        def num(key, default):
+            try:
+                return int(args[args.index(key) + 1]) if key in args else default
+            except (IndexError, ValueError):
+                return default
+        batch = num("--batch", 0) or num("--slots", 0)
+        parked = 0 if num("--conversation-cache-mib", 1) == 0 else num("--conversation-cache-slots", 4)
+        return (ADMIT_MIRROR or batch + parked + 1), max(256, num("--conversation-cache-min-tokens", 0))
+
+    def _served_prefix(self, h, prompt) -> int:
+        """What of `prompt` a cache holding the stream `h` serves (the engine reads only the rest): all of `h` when the
+        prompt continues it, else up to its turn checkpoint (the last <|im_start|> of `h`: the next request of a chat
+        renders the history again, but not the reply as decoded).  0: nothing.  `h` and `prompt` of one type (lists,
+        or int32 arrays)."""
+        if not h:
+            return 0
+        n = len(h)
+        # (a token at the end and one in the middle first: most streams that differ, differ there - no slices made)
+        if n < len(prompt) and prompt[n - 1] == h[n - 1] and prompt[n // 2] == h[n // 2] and prompt[:n] == h:
+            return n
+        k = self._turn_at(h)
+        return k if 0 < k < len(prompt) and prompt[k - 1] == h[k - 1] and prompt[:k] == h[:k] else 0
+
+    def _turn_at(self, h) -> int:
+        """The index of the last <|im_start|> in the held stream `h` (0: none).  Searched from the end in growing
+        windows: it is usually a reply's length before the end, so a long stream is not copied whole."""
+        n, w = len(h), 4096
+        while True:
+            lo = max(0, n - w)
+            tail = h[lo:]
+            if self.TURN_ID in tail:
+                return n - 1 - tail[::-1].index(self.TURN_ID)
+            if lo == 0:
+                return 0
+            w *= 4
+
+    def _same_conversation(self, h, p) -> bool:
+        """`p` goes on with the conversation of the stream `h` (all of it, or its history up to the reply): not just
+        a shared start such as an agent framework's system prompt and tools."""
+        return 2 * self._served_prefix(h, p) > len(h)
+
+    def _cache_hit(self, prompt) -> int:
+        """STRATA_ADMIT_UNCACHED: the longest start of `prompt` the engine's caches hold, as this server knows them -
+        an idle slot's held tokens, or a stream in the mirror (an estimate: the engine checks for itself)."""
+        hit = 0
+        busy = list(getattr(self, "slot_busy", []))
+        gs = 0 if getattr(self, "slot_padding_safe", False) else getattr(self, "slot_gs", 0)
+        valid = getattr(self, "slot_cache_valid", None)
+        for b, h in enumerate(list(getattr(self, "slot_held", []))):
+            if not h or b >= len(busy) or busy[b] or (valid is not None and b < len(valid) and not valid[b]):
+                continue
+            if gs > 1 and any(busy[b + 1:b - b % gs + gs]):
+                continue                                # a pipelined group's pad row writes it (see pick_slot)
+            hit = max(hit, self._served_prefix(h, prompt))
+        main = self.__dict__.get("main_held")             # the main session's conversation (exact, as the slots')
+        if main:
+            hit = max(hit, self._served_prefix(main, prompt))
+        mirror = self.__dict__.get("_mirror")
+        if mirror:
+            with _MIRROR_LOCK:
+                entries = list(mirror)
+            a = array("i", prompt)
+            for h in entries:
+                if len(h) > hit:
+                    hit = max(hit, self._served_prefix(h, a))
+        return hit
+
+    def _admit_len(self, prompt) -> tuple[int, int]:
+        """(the length the admission order and the give-way rule compare, the cache hit it assumes): the whole length,
+        or with STRATA_ADMIT_UNCACHED what the engine will read (the length minus the cached start)."""
+        n = len(prompt)
+        if not ADMIT_UNCACHED or n < 2:
+            return n, 0
+        try:
+            hit = min(self._cache_hit(prompt), n - 1)
+        except (OverflowError, TypeError, ValueError):   # (a token id outside int32: no estimate)
+            return n, 0
+        st = self.__dict__.get("swarm_stats")
+        if st is not None:
+            st["estimates"] += 1
+            st["est_hit_tokens"] += hit
+        return n - hit, hit
+
+    def _mirror_note(self, stream) -> None:
+        """STRATA_ADMIT_UNCACHED: a stream (prompt + what it decoded) the engine holds now - in a slot, its main
+        session, or parked in the conversation cache once overwritten.  It replaces the older turns of its own
+        conversation (streams it continues, at least up to their second half: not another agent's stream that only
+        shares the system prompt); the oldest go first past the mirror's size."""
+        mirror = self.__dict__.get("_mirror")
+        if not ADMIT_UNCACHED or mirror is None or len(stream) < getattr(self, "_mirror_min", 256):
+            return
+        try:
+            a = array("i", stream)
+        except (OverflowError, TypeError, ValueError):
+            return
+        cap = max(1, getattr(self, "_mirror_cap", 16))
+        with _MIRROR_LOCK:
+            mirror[:] = [h for h in mirror if not (h == a or self._same_conversation(h, a))]
+            mirror.append(a)
+            total = sum(len(h) for h in mirror)
+            while len(mirror) > cap or (total > ADMIT_MIRROR_TOKENS and len(mirror) > 1):
+                total -= len(mirror.pop(0))
+
+    def _mirror_feedback(self, prompt, hit: int, reused) -> None:
+        """STRATA_ADMIT_UNCACHED: the engine's own reused count for a prompt whose hit was estimated.  An estimate it
+        did not meet came from a stream the engine no longer holds (evicted from the conversation cache, a slot written
+        over): the mirror's streams that promised it go."""
+        st = self.__dict__.get("swarm_stats")
+        if not ADMIT_UNCACHED or reused is None or st is None:
+            return
+        reused = int(reused)
+        st["reused_tokens"] += reused
+        if hit <= 0 or reused + ADMIT_MISS_SLACK >= hit:
+            return
+        st["overestimates"] += 1
+        mirror = self.__dict__.get("_mirror")
+        if not mirror:
+            return
+        try:
+            a = array("i", prompt)
+        except (OverflowError, TypeError, ValueError):
+            return
+        with _MIRROR_LOCK:
+            keep = [h for h in mirror if self._served_prefix(h, a) <= reused + ADMIT_MISS_SLACK]
+            st["mirror_dropped"] += len(mirror) - len(keep)
+            mirror[:] = keep
+
+    def _slot_keep(self, b: int, prompt, wanted) -> int:
+        """STRATA_SLOT_AFFINITY (the caller holds slot_cv): what overwriting idle slot b costs - 0: nothing worth
+        keeping (empty, shorter than STRATA_SLOT_KEEP_MIN, held again by another idle slot that continues it, or the
+        start of `prompt` itself: its own conversation goes on there); 2: the start of a prompt waiting for a slot;
+        1: any other conversation."""
+        h = self.slot_held[b]
+        if not h or len(h) < SLOT_KEEP_MIN or self._same_conversation(h, prompt):
+            return 0
+        for w in wanted:
+            if self._same_conversation(h, w):
+                return 2
+        for x, o in enumerate(self.slot_held):
+            if x != b and not self.slot_busy[x] and len(o) > len(h) and self._same_conversation(h, o):
+                return 0
+        return 1
+
+    def _slot_wanted(self, me) -> list:
+        """STRATA_SLOT_AFFINITY: the prompts of the other requests that wait for a slot (the caller holds slot_cv)."""
+        return [p for k, p in self.__dict__.get("slot_wanted", {}).items() if k is not me]
+
+    def swarm_view(self) -> dict | None:
+        """/metrics: the swarm serving options and how the admission estimates met the engine (None: both off)."""
+        if not (ADMIT_UNCACHED or SLOT_AFFINITY):
+            return None
+        mirror = self.__dict__.get("_mirror") or []
+        with _MIRROR_LOCK:
+            n, toks = len(mirror), sum(len(h) for h in mirror)
+        return {"admit_uncached": ADMIT_UNCACHED, "slot_affinity": SLOT_AFFINITY, "mirror_streams": n,
+                "mirror_tokens": toks, **dict(self.__dict__.get("swarm_stats") or {})}
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
@@ -2072,9 +2274,40 @@ class StrataEngine:
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         first_read = None   # that read's cache source and placement hint, for the record: a continued leg's hint counts it too
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
-        ok = yield from self._take_control(cancel, len(prompt), new=True,
-                                           prompt=prompt if (COALESCE_PREFILL > 1 and not embeddings) else None)
+        est = {"n": -1, "len": 0, "hit": 0, "fed": True}
+
+        def alen():
+            # the length the admission order and the give-way rule compare: the whole prompt, or with
+            # STRATA_ADMIT_UNCACHED what the engine will read of it (estimated once per prompt: it only grows)
+            if est["n"] != len(prompt):
+                est["len"], est["hit"] = self._admit_len(prompt)
+                est["n"], est["fed"] = len(prompt), False
+            return est["len"]
+
+        def feedback():
+            # STRATA_ADMIT_UNCACHED: the engine's reused count for the prompt just read, against the estimate
+            if ADMIT_UNCACHED and not est["fed"] and est["n"] == len(prompt) and self._yielded is None:
+                est["fed"] = True
+                self._mirror_feedback(prompt, est["hit"], (self.last or {}).get("reused"))
+
+        def want(on):
+            # STRATA_SLOT_AFFINITY: this request's prompt among those waiting for a slot (pick_slot keeps their slots)
+            if SLOT_AFFINITY:
+                with self.slot_cv:
+                    wanted = self.__dict__.setdefault("slot_wanted", {})
+                    if on:
+                        wanted[cancel] = prompt
+                    else:
+                        wanted.pop(cancel, None)
+        want(True)
+        try:
+            ok = yield from self._take_control(cancel, alen(), new=True,
+                                               prompt=prompt if (COALESCE_PREFILL > 1 and not embeddings) else None)
+        except BaseException:
+            want(False)
+            raise
         if not ok:
+            want(False)
             self._release_preslot(cancel)
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -2087,19 +2320,20 @@ class StrataEngine:
         stop_sent = False
         yields, solo_again, refused = 0, 0, 0
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
+        spoiled = False
         slot_plan = None    # this request's own placement plan (slot_last_plan is shared: another request's pick can follow)
         park_slot = None    # a slot claimed for the engine park= copy of the main session
         solo_leg = None     # (prompt, len(out)) of a solo leg in flight - what the main session will hold
 
         def choose_slot():
             nonlocal slot_plan
-            chosen = self.pick_slot(prompt)
+            chosen = self.pick_slot(prompt, cancel)
             slot_plan = getattr(self, "slot_last_plan", None)   # (the caller holds slot_cv)
             return chosen
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
-                    ok = yield from self._take_control(cancel, len(prompt))
+                    ok = yield from self._take_control(cancel, alen())
                     if not ok:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -2138,9 +2372,9 @@ class StrataEngine:
                     def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
                         nonlocal reserved, slot_plan
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
-                                self._shorter_waiting(len(prompt))):
+                                self._shorter_waiting(alen())):
                             with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt)
+                                reserved = self.pick_slot(prompt, cancel)
                                 slot_plan = getattr(self, "slot_last_plan", None)
                                 if reserved is not None:
                                     self.slot_busy[reserved] = True
@@ -2172,6 +2406,7 @@ class StrataEngine:
                     self.main_peer, solo_leg = peer_ip, None
                     if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    feedback()
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
@@ -2194,6 +2429,7 @@ class StrataEngine:
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
                     if slot is None:
+                        want(True)
                         # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
                         # the start of this prompt (its conversation's last turn), else the one used longest ago.
                         # With none free the control lines are given back while waiting: a slot can be held by a read
@@ -2208,6 +2444,14 @@ class StrataEngine:
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
+                                    self.__dict__.get("slot_wanted", {}).pop(cancel, None)
+                                    if ((ADMIT_UNCACHED or SLOT_AFFINITY) and getattr(self, "slot_gs", 0) > 1 and
+                                            not getattr(self, "slot_padding_safe", False)):
+                                        # a pipelined group's pad rows write its idle slots below this one: what they
+                                        # held is gone (pick_slot), so the estimates and the choice no longer count it
+                                        for x in range(slot - slot % self.slot_gs, slot):
+                                            if not self.slot_busy[x]:
+                                                self.slot_held[x] = []
                                     if admit_wait:
                                         admit_wait = False
                                         self.admitting = max(0, self.admitting - 1)
@@ -2239,7 +2483,7 @@ class StrataEngine:
                             if cancel.is_set():
                                 return
                             if not holding:
-                                ok = yield from self._take_control(cancel, len(prompt))
+                                ok = yield from self._take_control(cancel, alen())
                                 if not ok:
                                     return
                                 holding, born = True, self.gen
@@ -2251,7 +2495,7 @@ class StrataEngine:
                         holding = False
                         with self.slot_cv:
                             epoch = self.ctl_epoch
-                        ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch)
+                        ok = yield from self._take_control(cancel, alen(), after_epoch=epoch)
                         if not ok:
                             return
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -2304,7 +2548,7 @@ class StrataEngine:
                     def ask():        # as give_way above, for the slot this admission reads into
                         nonlocal asked
                         if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                self._shorter_waiting(len(prompt))):
+                                self._shorter_waiting(alen())):
                             self._send(f"BYIELD {slot}")
                             asked = True
 
@@ -2361,6 +2605,7 @@ class StrataEngine:
                         yield t
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    feedback()
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
@@ -2428,9 +2673,15 @@ class StrataEngine:
                             btrace("back to the solo path")
                             break
                         return
+        except (EngineNonFinite, EngineDied):
+            spoiled = True                              # (the engine dropped the state, or is gone: nothing to note)
+            raise
         finally:
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
+            want(False)
+            if ADMIT_UNCACHED and out and not spoiled and self.gen == born:
+                self._mirror_note(list(ids) + out[:-1])  # what its slot / the main session holds now (then parked)
             try:
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
                     phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
@@ -2565,11 +2816,12 @@ class StrataEngine:
         self.cache_event("parked", slot=b, held_tokens=n)
         self._release_park(b)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def pick_slot(self, prompt: list[int], me=None) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago (with
         STRATA_SLOT_EXPIRE_S set: the one cheapest to lose, see slot_expire_s) - so the conversations other slots hold
-        stay for their next turns.  None: every slot is busy."""
+        stay for their next turns.  None: every slot is busy.  `me`: the asking request's key in slot_wanted
+        (STRATA_SLOT_AFFINITY: the other waiting requests' prompts are kept)."""
         gs = getattr(self, "slot_gs", 0)
         if gs and self.slot_cache_affinity:
             self.slot_last_plan = slot_policy.place(prompt, self.slot_busy, self.slot_held, self.slot_used,
@@ -2590,24 +2842,34 @@ class StrataEngine:
             def fills_hole(b):
                 g0 = b - b % gs
                 return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
-            return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
-        def held_prefix(b):
-            # what of `prompt` the slot's cache serves: the slot's whole held stream (the prompt and what it decoded)
-            # when this prompt continues it, else its turn checkpoint - the engine takes one at the last <|im_start|> of
-            # a prompt (the next request of the chat renders the history again, but not the reply it decoded or the
-            # assistant header), so a prompt that agrees with the held tokens up to there is that chat's next turn
-            # too (#2518: it was only found by the engine's own source search, after pick_slot had sent it to another
-            # slot and the request in that slot had overwritten the chat whose cache the next one needed)
-            h = self.slot_held[b]
-            if not h:
-                return 0
-            if len(h) < len(prompt) and prompt[:len(h)] == h:
-                return len(h)
-            k = len(h) - 1 - h[::-1].index(self.TURN_ID) if self.TURN_ID in h else 0
-            return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
-        best = max(free, key=held_prefix)
+            if not SLOT_AFFINITY:
+                return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
+            # STRATA_SLOT_AFFINITY: holes first as above, then the groups with the fewest busy slots, and among those
+            # the slot whose admission writes over the conversations least worth keeping: its own and those of the
+            # idle slots below it in its group (their pad rows).  A slot that fills a hole costs nothing (its
+            # conversation went with the busy slot above it).  Ties keep the spreading order.
+            wanted = self._slot_wanted(me)
+            busy_g = [0] * (len(self.slot_busy) // gs + 1)
+            for x, v in enumerate(self.slot_busy):
+                busy_g[x // gs] += 1 if v else 0
+
+            def cost(b):
+                if fills_hole(b):
+                    return 0
+                g0 = b - b % gs
+                lo = max([x + 1 for x in range(g0, b) if self.slot_busy[x]], default=g0)
+                return max(self._slot_keep(x, prompt, wanted) for x in range(lo, b + 1))
+            return min(free, key=lambda b: (not fills_hole(b), busy_g[b // gs], cost(b), self.slot_order.index(b)))
+        # what of `prompt` the slot's cache serves: the slot's whole held stream (the prompt and what it decoded) when
+        # this prompt continues it, else its turn checkpoint - the engine takes one at the last <|im_start|> of a prompt
+        # (the next request of the chat renders the history again, but not the reply it decoded or the assistant
+        # header), so a prompt that agrees with the held tokens up to there is that chat's next turn too (#2518: it was
+        # only found by the engine's own source search, after pick_slot had sent it to another slot and the request in
+        # that slot had overwritten the chat whose cache the next one needed)
+        held = {b: self._served_prefix(self.slot_held[b], prompt) for b in free}
+        best = max(free, key=held.__getitem__)
         # without --batch-groups a held prefix of any length is taken, as before
-        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
+        if held[best] >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
             return best
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
         # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
@@ -2626,6 +2888,13 @@ class StrataEngine:
             if now - self.slot_used[b] >= self.SLOT_EXPIRE_S:
                 return 1, 0
             return 2, len(h)
+        if SLOT_AFFINITY:
+            # ... with STRATA_SLOT_AFFINITY the slot whose conversation is least worth keeping before the least recent
+            # (see _slot_keep: a short side request's, one held again elsewhere; a waiting agent's start comes last)
+            wanted = self._slot_wanted(me)
+            return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
+                                            self._slot_keep(b, prompt, wanted), keep_value(b),
+                                            self.slot_used[b]))
         return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
                                         keep_value(b), self.slot_used[b]))
 
@@ -5347,6 +5616,9 @@ class Service:
                         parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
+            swarm = self.engine.swarm_view() if hasattr(self.engine, "swarm_view") else None
+            if swarm is not None:                       # opt-in swarm serving: the estimates against the engine's reuse
+                live["swarm"] = swarm
             if running and state == "idle":
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
