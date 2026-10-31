@@ -2237,7 +2237,8 @@ bool Prefill::bind_stage_helper(int64_t T) {
             return false;
     }
     const core::OnDevice on(P.dev);
-    mmq::iota(P.ident, T * K, P.s);           // the helper's row table: a refill may have overwritten its slots
+    // the helper's row table (carve padded it: h.T >= T): a refill may have overwritten its slots
+    mmq::iota(P.ident, T * K + (int64_t) MMQ_IDS_PAD, P.s);
     return true;
 }
 
@@ -2359,14 +2360,14 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         pp->pair = (int32_t*) take((size_t) Rt * 4);
     }
     pp->src = (int32_t*) take((size_t) Rt * 4);
-    pp->ident = (int32_t*) take((size_t) Rt * 4);
+    pp->ident = (int32_t*) take(((size_t) Rt + MMQ_IDS_PAD) * 4);   // MMQ reads ids past the last row (MMQ_IDS_PAD)
     pp->bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
     pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
     pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL);
     if (ok) {
         pp->ctx = std::make_unique<mmq::Context>();
         pp->run_ctx = pp->ctx.get();
-        mmq::iota(pp->ident, pp->cap_rows, pp->s);
+        mmq::iota(pp->ident, pp->cap_rows + (int64_t) MMQ_IDS_PAD, pp->s);
         peer_had_signs(*pp);   // APR: on the peer's device
         ok = cudaStreamSynchronize(pp->s) == cudaSuccess;
     }
