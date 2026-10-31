@@ -12986,6 +12986,7 @@ int main(int argc, char** argv) {
         int64_t ba_window = 0, bt_adapt_rounds = 0, bt_adapt_swaps = 0;
         double bt_adapt_wait = 0;
         bool in_prompt_read = false;   // batch_step runs between a prompt's chunks: the adaptive tier stands still then
+        bool loan_kept = false;        // STRATA_KEEP_LOAN_MS: an admission's loan is still out - the adaptive tier stands still too
         double serve_adapt_drain_ms = 0.0;   // 149: the request's wait for the adaptive round in flight
         int64_t bt_a_rounds0 = 0, bt_a_swapped0 = 0;   // the asynchronous tier's counters when the timed windows began
         Clock::time_point bt_start = Clock::now();
@@ -13341,7 +13342,7 @@ int main(int argc, char** argv) {
             // Never between a prompt's chunks (its loan of cache slots and its chunks read the tables); a request drains
             // the round before its prompt starts (adapt_tick(true) where the request begins).  The main thread's part is
             // small (the table changes and uploads); the copies are on the helper thread and the cards' refill streams.
-            if (ajob && !in_prompt_read) {
+            if (ajob && !in_prompt_read && !loan_kept) {
                 const Clock::time_point ta = Clock::now();
                 if (!adapt_tick(false)) {
                     std::printf("ERR an adaptive refill failed\n");
@@ -13380,7 +13381,8 @@ int main(int argc, char** argv) {
                 bool ok = true;
                 ~AdaptRun() { if (th.joinable()) th.join(); }   // an error return below still joins it
             } adapt_run;
-            if (!drive.d.usage.empty() && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 && pending.empty())
+            if (!drive.d.usage.empty() && !ajob && !in_prompt_read && !loan_kept && (++ba_window % o.adapt_every) == 0 &&
+                pending.empty())
                 adapt_run.th = std::thread([&] { adapt_run.ok = adapt(); });
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
             std::vector<int> keep(bs.size(), 0);
@@ -13797,7 +13799,7 @@ int main(int argc, char** argv) {
             p.every = pipe_adapt_every;
             p.tier_on = !drive.d.usage.empty();
             p.async_tier = (bool) ajob;
-            p.prompt_read = in_prompt_read;
+            p.prompt_read = in_prompt_read || loan_kept;   // (STRATA_KEEP_LOAN_MS: a kept loan counts as a read)
             p.swaps_pending = !pending.empty();
             p.windows = pa_windows;
             p.last = pa_last;
@@ -14113,10 +14115,143 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return pmtp_settle();
         };
+        // the batched path's slots are lent just before its first run and given back (refilled) before a window
+        // reads - so the windows always see the whole expert cache - or once the prompt is read
+        // Every participant gives its loan back here: the rows it lent are refilled into the SAME slots from
+        // the arena, the residency table is restored, and one upload puts it on every device.  A stage refills
+        // through its own cache and its own device - a slot refilled into the wrong cache would leave that
+        // stage's cache holding an expert it does not own, which is silent and produces plausible tokens.
+        // (split in two halves so a layer split can queue every stage's copies before it waits for any: #340)
+        // STRATA_REFILL_PARTS=1 (gfx1151's table): a lent slot of a GGUF read in place is refilled from the pieces in the mapping.
+        // The default assembles the blob in a staging buffer first (a 4 MB copy on this thread), then copies that.
+        static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
+        auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
+            tr("refill start", (long long) p.lent.size());
+            const strata::core::OnDevice on(p.dev);
+            for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                strata::core::BlobPart parts[3];
+                const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
+                if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
+                    if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
+                    host_res[(size_t) i] = slot;
+                    continue;
+                }
+                const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
+                                                        : p.cache->fill_slot_queued(slot, b, e, nb)))
+                    return false;
+                if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
+                host_res[(size_t) i] = slot;
+            }
+            return true;
+        };
+        auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
+            const strata::core::OnDevice on(p.dev);
+            if (!p.cache->sync_queued(e)) return false;
+#if defined(_WIN32)
+            // The copies have landed: the file pages touched by the loan need not stay in the working set.
+            for (const auto& [i, slot] : p.lent)
+                srcp->release(i / g.n_expert, i % g.n_expert);
+#endif
+            p.lent.clear();
+            p.lent_chunk = 0;
+            return true;
+        };
+        auto refill_one = [&](PfPart& p, std::string& e) -> bool {
+            if (p.lent.empty()) return true;
+            return refill_issue(p, e) && refill_wait(p, e);
+        };
+        // #340: with several stages every stage's copies go out first (each card on its own link), then each is
+        // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
+        // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
+        static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
+        auto refill = [&](std::string& e) -> bool {
+            const auto t_rf = Clock::now();
+            int64_t n_lent = 0, n_parts = 0;
+            for (PfPart& p : pf_parts)
+                if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
+            if (n_parts > 1 && !refill_serial) {
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty() && !refill_issue(p, e)) return false;
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty() && !refill_wait(p, e)) return false;
+            } else {
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty() && !refill_one(p, e)) return false;
+            }
+            if (n_parts > 0) res_upload();
+            if (trace && n_parts > 0) {
+                std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
+                             (long long) n_lent, (long long) n_parts,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+                std::fflush(stderr);
+            }
+            return true;
+        };
+        // STRATA_KEEP_LOAN_MS=N (opt-in, --batch; unset / 0: off, every admission refills its loan as before).  A batch
+        // admission's prompt read borrows the tail of every stage's expert cache (`lend`) and refills it from RAM
+        // before its tail windows and its first token (`refill`, ~0.3-1 s per admission with the GGUF read in place:
+        // a 4 MB staging copy per slot on this thread, stage after stage).  In a swarm the next admission follows
+        // within ~0.2 s (S1 run 2026-10-31: 84-89% of them within 500 ms) and lends the same slots again, so the
+        // refill is paid once per admission for nothing.  With the flag the loan stays out after a batch admission:
+        // the slots' windows meanwhile run the lent experts on the CPU (they are marked missing - the state the
+        // windows already meet between a prompt's pieces, STRATA_PIPED_READ_PIECE / STRATA_BATCH_DECODE_SHARE), the
+        // adaptive tier stands still, and the loan goes back (the same `refill`: the same bytes into the same slots)
+        // when no BGEN came within N ms, before any other command, and before the engine waits idle or ends.  The
+        // next BGEN reads with the loan as it is (`lend` keeps a loan that covers its chunk).
+        static const int64_t keep_loan_ms = [] {
+            const char* v = std::getenv("STRATA_KEEP_LOAN_MS");
+            return v != nullptr ? (int64_t) std::max(0LL, std::atoll(v)) : (int64_t) 0;
+        }();
+        Clock::time_point loan_kept_at{};
+        int64_t loan_n_kept = 0, loan_n_reused = 0, loan_n_back_idle = 0, loan_n_back_cmd = 0;
+        double loan_back_ms = 0.0;
+        auto loan_out = [&]() -> bool {
+            for (const PfPart& p : pf_parts)
+                if (!p.lent.empty()) return true;
+            return false;
+        };
+        auto loan_give_back = [&](const char* why, bool idle) -> bool {
+            if (!loan_kept) return true;
+            loan_kept = false;
+            const auto t_lb = Clock::now();
+            std::string e;
+            if (!refill(e)) {
+                std::printf("ERR refilling a lent slot failed: %s\n", e.c_str());
+                std::fflush(stdout);
+                return false;
+            }
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_lb).count();
+            loan_back_ms += ms;
+            ++(idle ? loan_n_back_idle : loan_n_back_cmd);
+            if (idle)   // (once a quiet spell: cumulative counters)
+                std::fprintf(stderr, "strata batch STRATA_KEEP_LOAN_MS=%lld: %lld admissions kept their loan, %lld reads took a "
+                                     "kept loan, given back %lld times when quiet and %lld before a command (%.0f ms of refills)\n",
+                             (long long) keep_loan_ms, (long long) loan_n_kept, (long long) loan_n_reused,
+                             (long long) loan_n_back_idle, (long long) loan_n_back_cmd, loan_back_ms);
+            if (trace) {
+                std::fprintf(stderr, "strata trace: kept loan given back (%s) %.1f ms after the admission, refill %.1f ms\n", why,
+                             std::chrono::duration<double, std::milli>(t_lb - loan_kept_at).count(), ms);
+                std::fflush(stderr);
+            }
+            return true;
+        };
+        if (keep_loan_ms > 0 && o.batch > 0)
+            std::fprintf(stderr, "strata batch: STRATA_KEEP_LOAN_MS=%lld: a batch admission's prompt loan stays out for up to "
+                                 "%lld ms for the next admission (the lent experts run on the CPU meanwhile)%s\n",
+                         (long long) keep_loan_ms, (long long) keep_loan_ms,
+                         pf_parts.empty() ? " - but the prompt path borrows no cache slots here" : "");
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
+                    // STRATA_KEEP_LOAN_MS: no admission came within the window - the loan goes back (the groups drained
+                    // first: the windows in flight read the residency table that the refill restores)
+                    if (loan_kept && Clock::now() - loan_kept_at >= std::chrono::milliseconds(keep_loan_ms)) {
+                        if (piped && !pipe_drain()) return 1;
+                        if (!loan_give_back("no admission within the window", true)) return 1;
+                    }
                     if (!(piped ? pump(true) : batch_step())) return 1;
                     continue;
                 }
@@ -14139,8 +14274,21 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                     }
                 }
-            } else if (!next_line(line)) {
-                break;
+            } else {
+                if (loan_kept) {   // STRATA_KEEP_LOAN_MS: nothing decodes - the next line within the window, else the loan goes back
+                    bool any = false;
+                    {
+                        std::unique_lock<std::mutex> lk(in_mu);
+                        in_cv.wait_until(lk, loan_kept_at + std::chrono::milliseconds(keep_loan_ms),
+                                         [&] { return !in_lines.empty() || in_eof; });
+                        any = !in_lines.empty();
+                    }
+                    if (!any && !loan_give_back("idle", true)) return 1;
+                }
+                if (!next_line(line)) {
+                    if (!loan_give_back("end", true)) return 1;
+                    break;
+                }
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
@@ -14170,6 +14318,10 @@ int main(int argc, char** argv) {
                                  (int) std::count_if(pg.begin(), pg.end(), [](const PGroup& G) { return G.inflight; }));
                 continue;
             }
+            // STRATA_KEEP_LOAN_MS: only a BGEN reads with the kept loan; any other command gets the whole cache back first
+            // (here the groups are drained: every line but BSTOP drained them above)
+            if (loan_kept && line.rfind("BGEN ", 0) != 0 && !loan_give_back(line.substr(0, std::min(line.find(' '), line.size())).c_str(), false))
+                return 1;
             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
                 std::string verr;
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
@@ -15718,80 +15870,6 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return true;
             };
-            // the batched path's slots are lent just before its first run and given back (refilled) before a window
-            // reads - so the windows always see the whole expert cache - or once the prompt is read
-            // Every participant gives its loan back here: the rows it lent are refilled into the SAME slots from
-            // the arena, the residency table is restored, and one upload puts it on every device.  A stage refills
-            // through its own cache and its own device - a slot refilled into the wrong cache would leave that
-            // stage's cache holding an expert it does not own, which is silent and produces plausible tokens.
-            // (split in two halves so a layer split can queue every stage's copies before it waits for any: #340)
-            // STRATA_REFILL_PARTS=1 (gfx1151's table): a lent slot of a GGUF read in place is refilled from the pieces in the mapping.
-            // The default assembles the blob in a staging buffer first (a 4 MB copy on this thread), then copies that.
-            static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
-            auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
-                tr("refill start", (long long) p.lent.size());
-                const strata::core::OnDevice on(p.dev);
-                for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                    strata::core::BlobPart parts[3];
-                    const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
-                    if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
-                        if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
-                        host_res[(size_t) i] = slot;
-                        continue;
-                    }
-                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
-                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                    if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
-                                                            : p.cache->fill_slot_queued(slot, b, e, nb)))
-                        return false;
-                    if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
-                    host_res[(size_t) i] = slot;
-                }
-                return true;
-            };
-            auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
-                const strata::core::OnDevice on(p.dev);
-                if (!p.cache->sync_queued(e)) return false;
-#if defined(_WIN32)
-                // The copies have landed: the file pages touched by the loan need not stay in the working set.
-                for (const auto& [i, slot] : p.lent)
-                    srcp->release(i / g.n_expert, i % g.n_expert);
-#endif
-                p.lent.clear();
-                p.lent_chunk = 0;
-                return true;
-            };
-            auto refill_one = [&](PfPart& p, std::string& e) -> bool {
-                if (p.lent.empty()) return true;
-                return refill_issue(p, e) && refill_wait(p, e);
-            };
-            // #340: with several stages every stage's copies go out first (each card on its own link), then each is
-            // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
-            // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
-            static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
-            auto refill = [&](std::string& e) -> bool {
-                const auto t_rf = Clock::now();
-                int64_t n_lent = 0, n_parts = 0;
-                for (PfPart& p : pf_parts)
-                    if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
-                if (n_parts > 1 && !refill_serial) {
-                    for (PfPart& p : pf_parts)
-                        if (!p.lent.empty() && !refill_issue(p, e)) return false;
-                    for (PfPart& p : pf_parts)
-                        if (!p.lent.empty() && !refill_wait(p, e)) return false;
-                } else {
-                    for (PfPart& p : pf_parts)
-                        if (!p.lent.empty() && !refill_one(p, e)) return false;
-                }
-                if (n_parts > 0) res_upload();
-                if (trace && n_parts > 0) {
-                    std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
-                                 (long long) n_lent, (long long) n_parts,
-                                 std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
-                    std::fflush(stderr);
-                }
-                return true;
-            };
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
@@ -16593,6 +16671,20 @@ int main(int argc, char** argv) {
             for (int q = 2; q < pl_ns && pipe; ++q) stage_ver_q(0, q).set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
             tr("prompt start", n - 1);
+            // STRATA_KEEP_LOAN_MS: a batch admission (no pictures, no elastic K/V, no head alias) keeps its loan once its
+            // prompt is read; a loan the last admission kept is this read's now (`lend` keeps it when it covers the chunk,
+            // else gives that participant's back and lends again, as between two parts of one prompt)
+            const bool keep_loan = keep_loan_ms > 0 && o.batch > 0 && admit_slot >= 0 && req_imgs.empty() && !kvg.on &&
+                                   !o.prefill_head_alias && !pf_parts.empty();
+            if (loan_kept) {
+                loan_kept = false;
+                ++loan_n_reused;
+                if (trace) {
+                    std::fprintf(stderr, "strata trace: the kept loan goes to this admission (%.1f ms after the last)\n",
+                                 std::chrono::duration<double, std::milli>(Clock::now() - loan_kept_at).count());
+                    std::fflush(stderr);
+                }
+            }
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
             // chat renders the same history - but not always the same header or the thinking of this reply - so that
@@ -16703,7 +16795,7 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
-                if (win && !refill(err)) {
+                if (win && !keep_loan && !refill(err)) {   // (STRATA_KEEP_LOAN_MS: the windows run the lent experts on the CPU)
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -16777,7 +16869,18 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
-            if (!refill(err)) {
+            if (keep_loan && !cancelled && loan_out()) {   // STRATA_KEEP_LOAN_MS: the loan stays out for the next admission
+                loan_kept = true;
+                loan_kept_at = Clock::now();
+                ++loan_n_kept;
+                if (trace) {
+                    int64_t n_lent = 0;
+                    for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
+                    std::fprintf(stderr, "strata trace: loan kept: %lld slots stay lent for up to %lld ms\n", (long long) n_lent,
+                                 (long long) keep_loan_ms);
+                    std::fflush(stderr);
+                }
+            } else if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
