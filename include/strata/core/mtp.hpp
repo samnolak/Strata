@@ -17,11 +17,15 @@
 //     below 2,051 cells - so speculative cells (draft steps, rejected window rows) never touch indexer state and
 //     are simply overwritten when their positions are processed again;
 //   * all 512 routed experts live in VRAM (708 MB) and run through the grouped hit kernels.
+//   * p/mtp-q8 (issue #3728, opt-in by the rt directory): an rt/ with experts.txt (tools/mtp_rt.py from a GGUF packed
+//     with `mtp_pack.py --experts q8_0`) holds the experts in the main model's native layout instead (Q8_0: 2.49 GiB),
+//     and they run through native_expert_grouped - the verify window's kernels.  No experts.txt: Q2_0 as above.
 #pragma once
 
 #include "strata/core/layer.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -35,6 +39,22 @@
 namespace strata::core {
 
 class NativeHead;
+
+/// The drafter's routed-expert format, from rt/experts.txt (tools/mtp_rt.py):
+///   `<name> <gu_type> <d_type> <n_embd> <n_ff> <n_expert> <blob_bytes>`   e.g. `q8_0 8 8 2560 640 512 5222400`
+/// No experts.txt: the Q2_0 planar blob of kernels/cpu/expert.hpp (native = false, every other field unset).
+struct MtpExpertFormat {
+    bool native = false;
+    std::string name = "q2_0";
+    int gu_type = -1, d_type = -1;
+    int64_t n_embd = 0, n_ff = 0, n_expert = 0;
+    uint64_t blob = 0;   ///< bytes per expert (native only)
+};
+/// Reads `rt_dir`/experts.txt into `f`; false (with `err`) for a malformed or unknown marker.  Touches no GPU.
+bool mtp_expert_format(const std::string& rt_dir, MtpExpertFormat& f, std::string& err);
+/// The bytes the drafter's 512 experts take in VRAM beyond the Q2_0 blobs (0 for Q2_0 or an unreadable rt_dir): what
+/// the layer split adds to its drafter reserve (program/stage_reserve.hpp's kDrafterMib was sized for Q2_0).
+uint64_t mtp_expert_extra_bytes(const std::string& rt_dir);
 
 class MtpDrafter {
 public:
@@ -73,6 +93,8 @@ public:
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
+    /// The routed experts' format load() settled (rt/experts.txt; Q2_0 without one).
+    const MtpExpertFormat& expert_format() const { return xfmt_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
@@ -276,6 +298,11 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    // p/mtp-q8: the experts' format; native: their layout, the q8_1 rows of mixed_ and native_expert_grouped's scratch
+    MtpExpertFormat xfmt_;
+    strata::kernels::NativeExpertLayout xlay_;
+    uint8_t* nat_xq_ = nullptr;
+    void* nat_scratch_ = nullptr;
     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;

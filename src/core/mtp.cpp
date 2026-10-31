@@ -262,6 +262,37 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 #endif
 }
 
+// p/mtp-q8: rt/experts.txt (tools/mtp_rt.py writes it for a GGUF packed with --experts q8_0 | q4_0)
+bool mtp_expert_format(const std::string& rt_dir, MtpExpertFormat& f, std::string& err) {
+    f = MtpExpertFormat{};
+    std::ifstream in(rt_dir + "/experts.txt");
+    if (!in) return true;   // no marker: the Q2_0 planar blobs, as every rt directory before it
+    std::string line;
+    while (std::getline(in, line) && line.find_first_not_of(" \t\r") == std::string::npos) {}
+    std::istringstream is(line);
+    MtpExpertFormat r;
+    is >> r.name >> r.gu_type >> r.d_type >> r.n_embd >> r.n_ff >> r.n_expert >> r.blob;
+    if (!is) { err = "mtp: malformed " + rt_dir + "/experts.txt: \"" + line + "\""; return false; }
+    // the formats tools/mtp_rt.py writes (ggml ids: Q8_0 = 8, Q4_0 = 2), both roles the same type
+    const bool known = (r.name == "q8_0" && r.gu_type == GGML_Q8_0 && r.d_type == GGML_Q8_0) ||
+                       (r.name == "q4_0" && r.gu_type == GGML_Q4_0 && r.d_type == GGML_Q4_0);
+    if (!known || r.n_embd <= 0 || r.n_ff <= 0 || r.n_expert <= 0 || r.blob == 0) {
+        err = "mtp: " + rt_dir + "/experts.txt names an expert format this engine does not run: \"" + line + "\"";
+        return false;
+    }
+    r.native = true;
+    f = r;
+    return true;
+}
+
+uint64_t mtp_expert_extra_bytes(const std::string& rt_dir) {
+    MtpExpertFormat f;
+    std::string e;
+    if (rt_dir.empty() || !mtp_expert_format(rt_dir, f, e) || !f.native) return 0;
+    const uint64_t q2 = (uint64_t) f.n_expert * strata::kernels::cpu::BLOB, nat = (uint64_t) f.n_expert * f.blob;
+    return nat > q2 ? nat - q2 : 0;
+}
+
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window, const MtpDrafter* shared) {
 #if defined(STRATA_GPU_METAL)
@@ -269,6 +300,11 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     g_ = &g;
     ss_ = &ss;
     max_t_ = max_t;
+    {   // p/mtp-q8: the Metal drafter reads experts.bin as Q2_0 only
+        MtpExpertFormat xf;
+        if (!mtp_expert_format(rt_dir, xf, err)) return false;
+        if (xf.native) { err = "mtp: the Metal drafter runs Q2_0 experts only (" + rt_dir + "/experts.txt: " + xf.name + ")"; return false; }
+    }
     return strata::metal_engine::mtp_load(rt_dir, max_t, err);
 #endif
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
@@ -288,9 +324,34 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         dense_ = shared->dense_;
         experts_ = shared->experts_;
         tensors_ = shared->tensors_;
+        xfmt_ = shared->xfmt_;
+        xlay_ = shared->xlay_;
         owns_weights_ = false;
         owns_draft_head_ = false;
     }
+#if !defined(STRATA_GPU_METAL)
+    // p/mtp-q8: the experts' format (rt/experts.txt), checked before anything is read or allocated
+    if (shared == nullptr) {
+        if (!mtp_expert_format(rt_dir, xfmt_, err)) return false;
+        if (xfmt_.native) {
+            if (xfmt_.n_embd != g.n_embd || xfmt_.n_ff != g.n_ff || xfmt_.n_expert != g.n_expert) {
+                err = "mtp: " + rt_dir + "/experts.txt is for another geometry (n_embd " + std::to_string(xfmt_.n_embd) +
+                      ", n_ff " + std::to_string(xfmt_.n_ff) + ", " + std::to_string(xfmt_.n_expert) + " experts)";
+                return false;
+            }
+            if (!strata::kernels::native_expert_supported(xfmt_.gu_type, xfmt_.d_type, g.n_embd, g.n_ff)) {
+                err = "mtp: this engine has no grouped expert kernels for the drafter's " + xfmt_.name + " experts";
+                return false;
+            }
+            xlay_ = strata::kernels::native_expert_layout(xfmt_.gu_type, xfmt_.d_type, g.n_embd, g.n_ff);
+            if (xlay_.bytes != xfmt_.blob || xlay_.tail_off != 0) {
+                err = "mtp: experts.txt says " + std::to_string(xfmt_.blob) + " bytes per expert, the " + xfmt_.name +
+                      " layout has " + std::to_string(xlay_.bytes);
+                return false;
+            }
+        }
+    }
+#endif
     // Loader fix (0.1.15+loaderfix.2): the two reads below are the whole “drafter files” cost; reporting
     // them apart from the rest of the stage is what makes the next regression visible.
     const auto t_files = std::chrono::steady_clock::now();
@@ -324,7 +385,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     // ---- the 512 routed experts, one blob each
     if (shared == nullptr) {
-        const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
+        const uint64_t bytes = (uint64_t) g.n_expert * (xfmt_.native ? (uint64_t) xlay_.bytes : (uint64_t) strata::kernels::cpu::BLOB);
         // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
         // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
         FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
@@ -333,7 +394,16 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             FILE* f;
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
-        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+        if (xfmt_.native) {   // p/mtp-q8: a native experts.bin is exactly n_expert blobs (a Q2_0 file left beside the marker is not)
+            const bool sized = STRATA_FILE_SEEK64(f, 0, SEEK_END) == 0 && (uint64_t) STRATA_FILE_TELL64(f) == bytes &&
+                               STRATA_FILE_SEEK64(f, 0, SEEK_SET) == 0;
+            if (!sized) { err = "mtp: experts.bin is not " + std::to_string(bytes) + " bytes of " + xfmt_.name + " experts (experts.txt)"; return false; }
+        }
+        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) {
+            err = xfmt_.native ? "mtp: the 512 " + xfmt_.name + " experts (" + std::to_string(bytes >> 20) + " MiB) do not fit in VRAM"
+                               : "mtp: the 512 experts do not fit in VRAM";
+            return false;
+        }
 #if !defined(_WIN32)
         strata::platform::advise_willneed(fileno(f), 0, bytes);
 #endif
@@ -454,6 +524,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         top_scratch_ = b.take<uint8_t>(strata::kernels::row_top_prob_scratch_bytes((int) T));
         dummy_inj_ = b.take<float>(HC);
+#if !defined(STRATA_GPU_METAL)
+        if (xfmt_.native) {   // p/mtp-q8: mixed_'s q8_1 rows (36 bytes per 32 values) and native_expert_grouped's scratch
+            nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+            nat_scratch_ = b.take<uint8_t>(strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff));
+        }
+#endif
     };
     Bump count;
     carve(count);
@@ -531,11 +607,11 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
                      (double) vram_ / 1048576.0);
     } else {
-        std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
-                     (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
+        const double xbytes = (double) g.n_expert * (xfmt_.native ? (double) xlay_.bytes : (double) strata::kernels::cpu::BLOB);
+        std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f%s, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
+                     (double) vram_ / 1048576.0, xbytes / 1048576.0, xfmt_.native ? (" " + xfmt_.name).c_str() : "",
                      (double) tensors_.back().off / 1048576.0, files_s,
-                     files_s > 0 ? ((double) g.n_expert * strata::kernels::cpu::BLOB + (double) tensors_.back().off) /
-                                       1048576.0 / files_s : 0.0);
+                     files_s > 0 ? (xbytes + (double) tensors_.back().off) / 1048576.0 / files_s : 0.0);
     }
     return true;
 }
@@ -1170,11 +1246,24 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             } catch (const std::exception& e) { err = std::string("mtp route-resident: ") + e.what(); return false; }
         }
         g_mp.stamp(9, cs);
+#if !defined(STRATA_GPU_METAL)
+        if (xfmt_.native) {
+            // p/mtp-q8: the native blobs (Q8_0 / Q4_0 rows, rt/experts.txt) through the verify window's grouped kernels:
+            // the same groups (base + id * blob), q8_1 activations, the entries' rows of parts_ as moe_grouped_s2 writes them
+            moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) xlay_.bytes, grp_ptr_, grp_start_,
+                               grp_counts_, hit_dst_, hit_slot_, cs);
+            quantize_q8_1_rows(mixed_, (int64_t) T, (int64_t) N, nat_xq_, cs);
+            native_expert_grouped(xlay_, grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K,
+                                  (int64_t) T * K, nat_xq_, nat_scratch_, parts_, cs);
+        } else
+#endif
+        {
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
         quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
         moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
                        hit_xs_, hit_scratch_, parts_, cs);
+        }
         g_mp.stamp(10, cs);
         if (branch_on) {
             if (cudaStreamWaitEvent(cs, sh_join_, 0) != cudaSuccess) { err = "mtp: the shared expert's join"; return false; }

@@ -65,6 +65,17 @@ int main() {
         in.pipe_snap_mib = 96;
         check(reserve_mib(in) == 796, "the first card books the pipeline's second GDN state");
     }
+    // p/mtp-q8: a Q8_0 drafter (rt/experts.txt) books its experts' extra MiB on the drafter's stage only; 0 = the Q2_0 numbers
+    {
+        Inputs in;
+        in.base_reserve_mib = 700;
+        in.later = true;
+        in.drafter = true;
+        in.drafter_extra_mib = 1875;
+        check(reserve_mib(in) == 700 + 96 + 1000 + 1875, "a Q8_0 drafter's stage keeps 3671 MiB planned");
+        in.drafter = false;
+        check(reserve_mib(in) == 796, "the extra drafter MiB never land on a stage without the drafter");
+    }
     // the same arithmetic with --vram-reserve-later-mib 1400 (the workaround that worked in #3702)
     {
         Inputs in;
