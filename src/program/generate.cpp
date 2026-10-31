@@ -4941,7 +4941,9 @@ int main(int argc, char** argv) {
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
             const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
-            const int64_t held_back = session + (((int64_t) o.vram_reserve_mib + 1000 + 96) << 20);   // + drafter/head, windows
+            // p/mtp-q8: + the drafter's experts beyond Q2_0's when rt/experts.txt names a larger format (0 otherwise)
+            const int64_t held_back = session + (((int64_t) o.vram_reserve_mib + 1000 + 96) << 20) +
+                                      (int64_t) strata::core::mtp_expert_extra_bytes(o.mtp);   // + drafter/head, windows
             const int64_t room = (int64_t) fb - held_back;
             cudaDeviceProp dp{};
             cudaGetDeviceProperties(&dp, 0);
@@ -5296,6 +5298,11 @@ int main(int argc, char** argv) {
         const char* v = std::getenv("STRATA_SPLIT_OWN_PLACE");
         return v != nullptr && std::string(v) == "reserve";
     }();
+    // p/mtp-q8: the drafter's experts beyond the Q2_0 blobs kDrafterMib was sized for (rt/experts.txt; 0 for Q2_0)
+    const int64_t mtp_extra_mib = (int64_t) ((strata::core::mtp_expert_extra_bytes(o.mtp) + (1u << 20) - 1) >> 20);
+    if (mtp_extra_mib > 0 && multi_gpu)
+        std::fprintf(stderr, "strata generate: layer split: the drafter's experts (rt/experts.txt) take %lld MiB more than "
+                             "Q2_0's; reserved on its stage\n", (long long) mtp_extra_mib);
     auto stage_room = [&](int dev, bool later, bool drafter, bool search = false) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
@@ -5312,6 +5319,7 @@ int main(int argc, char** argv) {
         rin.drafter = drafter;
         rin.pipe_window_mib = kPipeWindowMib;
         rin.pipe_snap_mib = kPipeSnapMib;
+        rin.drafter_extra_mib = drafter ? mtp_extra_mib : 0;
         return strata::program::stage_reserve::room_bytes((int64_t) fb, rin);
     };
     if (multi_gpu && split_auto) {

@@ -10,6 +10,13 @@ Writes
                 engine's multi-column MMVQ can run them; the hyper-connection and router weights kept BF16; the
                 RMSNorm weights as F32 with the Gemma "+1" applied (vLLM GemmaRMSNorm scales by 1 + w).
   dense.txt     one line per tensor: name kind rows cols offset bytes   (kind = q8_0 | bf16 | f32)
+
+A GGUF packed with `mtp_pack.py --experts q8_0` (or q4_0) gives instead
+  experts.bin   512 blobs in the native expert layout (`NativeExpertLayout`, `include/strata/kernels/iq_kernels.hpp`):
+                [gate rows | up rows | down rows], the GGUF's own blocks unchanged (Q8_0: 5,222,400 B per expert)
+  experts.txt   the format marker the engine reads: `<format> <gu_type> <d_type> <n_embd> <n_ff> <n_expert> <blob_bytes>`
+                (e.g. `q8_0 8 8 2560 640 512 5222400`).  No experts.txt = the Q2_0 planar layout above, so a Q2_0
+                rt directory is written exactly as before.
 """
 from __future__ import annotations
 
@@ -58,6 +65,33 @@ def blob_of(gu: np.ndarray, dn: np.ndarray) -> bytes:
     return out
 
 
+# formats with a native-layout runtime blob: name -> (ggml type id, values per block, bytes per block)
+NATIVE = {"q8_0": (8, 32, 34), "q4_0": (2, 32, 18)}
+
+
+def native_blob_of(gu: np.ndarray, dn: np.ndarray, rb_gu: int, rb_dn: int) -> bytes:
+    """gu: (1280, rb_gu) rows of GGUF blocks (gate rows 0..639, up rows 640..1279); dn: (2560, rb_dn).  The blob is
+    the rows as they are: gate rows, then up rows (up_off = 640 * rb_gu), then down rows (down_off = 2 * up_off)."""
+    out = np.ascontiguousarray(gu).tobytes() + np.ascontiguousarray(dn).tobytes()
+    assert len(out) == 2 * FF * rb_gu + H * rb_dn, len(out)
+    return out
+
+
+def expert_format(r, gu_t, dn_t) -> str:
+    """strata.mtp.expert_format from mtp_pack.py, checked against the tensors' ggml types."""
+    fmt = None
+    f = r.fields.get("strata.mtp.expert_format")
+    if f is not None:
+        fmt = bytes(f.parts[f.data[0]]).decode("utf-8")
+    by_type = {42: "q2_0", 8: "q8_0", 2: "q4_0"}
+    t_gu, t_dn = int(gu_t.tensor_type), int(dn_t.tensor_type)
+    if t_gu != t_dn or t_gu not in by_type:
+        raise SystemExit(f"mtp_rt: expert tensor types {t_gu}/{t_dn} are not one supported format (q2_0, q8_0, q4_0)")
+    if fmt is not None and fmt != by_type[t_gu]:
+        raise SystemExit(f"mtp_rt: strata.mtp.expert_format {fmt!r} but the expert tensors are {by_type[t_gu]}")
+    return by_type[t_gu]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gguf", required=True)
@@ -67,12 +101,29 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     r = gguf.GGUFReader(a.gguf)
     tens = {t.name: t for t in r.tensors}
-    gu = np.asarray(tens["mtp.layers.0.mlp.experts.gate_up_proj"].data)
-    dn = np.asarray(tens["mtp.layers.0.mlp.experts.down_proj"].data)
-    assert gu.shape == (NE, 2 * FF, 720) and dn.shape == (NE, H, 180), (gu.shape, dn.shape)
-    with open(out / "experts.bin", "wb") as f:
-        for e in range(NE):
-            f.write(blob_of(gu[e], dn[e]))
+    gu_t, dn_t = tens["mtp.layers.0.mlp.experts.gate_up_proj"], tens["mtp.layers.0.mlp.experts.down_proj"]
+    fmt = expert_format(r, gu_t, dn_t)
+    gu = np.asarray(gu_t.data)
+    dn = np.asarray(dn_t.data)
+    marker = out / "experts.txt"
+    if fmt == "q2_0":
+        assert gu.shape == (NE, 2 * FF, 720) and dn.shape == (NE, H, 180), (gu.shape, dn.shape)
+        if marker.exists():   # a directory reused for Q2_0: the engine must not read a stale native marker
+            marker.unlink()
+        with open(out / "experts.bin", "wb") as f:
+            for e in range(NE):
+                f.write(blob_of(gu[e], dn[e]))
+        expert_bytes = NE * BLOB
+    else:
+        ty, qk, bb = NATIVE[fmt]
+        rb_gu, rb_dn = H // qk * bb, FF // qk * bb
+        assert gu.shape == (NE, 2 * FF, rb_gu) and dn.shape == (NE, H, rb_dn), (gu.shape, dn.shape)
+        blob = 2 * FF * rb_gu + H * rb_dn
+        with open(out / "experts.bin", "wb") as f:
+            for e in range(NE):
+                f.write(native_blob_of(gu[e], dn[e], rb_gu, rb_dn))
+        expert_bytes = NE * blob
+        marker.write_text(f"{fmt} {ty} {ty} {H} {FF} {NE} {blob}\n", encoding="utf-8")
     lines = []
     off = 0
     with open(out / "dense.bin", "wb") as f:
@@ -101,7 +152,7 @@ def main() -> int:
             lines.append(f"{short} {kind} {rows} {cols} {off} {len(raw)}")
             off += len(raw)
     (out / "dense.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"experts.bin {NE * BLOB} B, dense.bin {off} B, {len(lines)} tensors -> {out}")
+    print(f"experts.bin {expert_bytes} B ({fmt}), dense.bin {off} B, {len(lines)} tensors -> {out}")
     for l in lines:
         print("  " + l)
     return 0
