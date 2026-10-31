@@ -97,6 +97,7 @@
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
+#include "strata/spec/swarm_schedule.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
@@ -12521,6 +12522,13 @@ int main(int argc, char** argv) {
             std::array<int32_t, strata::kernels::kVerifyNarrowT> draft{}; ///< the slot's next MTP proposal
             bool draft_ready = false;
             int n_drafts = 1;              ///< STRATA_PIPED_MTP: how many of `draft` its next window checks
+            // STRATA_SWARM_SPEC (opt-in; untouched without it): the draft layer's probabilities of `draft` (dprob, n_prob
+            // of them: the latest the slot's chain gave), those of the proposals its window in flight verifies (vprob,
+            // n_ver), its chain's length and start, and whether a group waited for that chain
+            std::array<float, strata::kernels::kVerifyNarrowT> dprob{}, vprob{};
+            int n_prob = 0, n_ver = 0, chain_n = 0;
+            Clock::time_point chain_t0{};
+            bool chain_waited = false;
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
             Clock::time_point t0;
@@ -13044,6 +13052,28 @@ int main(int argc, char** argv) {
                          "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
                          "--batch-mtp's per-slot MTP drafts do not run there (their drafters still hold VRAM, about 0.9 GB per "
                          "slot). Drop --batch-mtp, or use --batch-groups 1.\n", o.batch_groups);
+        // STRATA_SWARM_SPEC=1|2 (opt-in; unset or 0: the rule above, exactly as before): which proposals a pipelined group's
+        // window verifies comes from one schedule over every slot (spec/swarm_schedule.hpp, DSpark's global rule) instead
+        // of --spec-min-p per slot; 2 also ends each slot's next drafter chain one step past what its window verified.
+        // Only which rows are verified changes: every verified row is judged as before, so the tokens stay the same.
+        const int sws = [&] {
+            const int m = strata::spec::swarm_spec_mode(std::getenv("STRATA_SWARM_SPEC"));
+            if (m == 0 || o.batch <= 0) return 0;
+            if (!pmtp) {
+                std::fprintf(stderr, "strata generate: WARNING: STRATA_SWARM_SPEC is off: it needs STRATA_PIPED_MTP running "
+                                     "(--batch-mtp, a layer split, 2 or more pipelined groups)\n");
+                return 0;
+            }
+            std::fprintf(stderr, "strata generate: STRATA_SWARM_SPEC=%d: the %d groups' proposals (0 to %d per slot) are "
+                                 "chosen by one schedule over all %d slots%s\n", m, o.batch_groups, pm_drafts, o.batch,
+                         m == 2 ? "; each drafter chain ends one step past its slot's verified proposals" : "");
+            return m;
+        }();
+        strata::spec::SwarmSchedule swarm(n_pipe);
+        std::vector<Clock::time_point> sw_stage_t0((size_t) n_pipe);
+        std::vector<int> sw_stage_rows((size_t) n_pipe, 0);
+        int64_t sw_plans = 0, sw_slot_windows = 0, sw_props = 0, sw_zero = 0;
+        double sw_model = 0.0;
         if (GS > strata::kernels::kVerifyMaxT && !batch_mtp) {   // (slots_in_windows keeps it so: a group's window is
             // PGroup's rows, and the serial windows reach only the first kVerifyMaxT slots)
             std::fprintf(stderr, "strata generate: --batch %d in %d group%s: more than %d rows per window\n",
@@ -13104,9 +13134,25 @@ int main(int argc, char** argv) {
                 const int r = slot_mtp[(size_t) b]->chain_poll(err);
                 if (r < 0) { std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str()); return -1; }
                 if (r == 1) break;
-                if (!wait) return 0;
+                if (!wait) { if (sws) bs[(size_t) b].chain_waited = true; return 0; }
             }
             pm_drafting[(size_t) b] = 0;
+            if (sws) {   // STRATA_SWARM_SPEC: every proposal of the chain and its probability; the schedule picks at launch
+                BSlot& sl = bs[(size_t) b];
+                if (sl.chain_waited && !wait)   // a group waited for this chain: its time is on a group's trip
+                    swarm.observe_draft_wait(std::chrono::duration<double, std::milli>(Clock::now() - sl.chain_t0).count());
+                sl.chain_waited = false;
+                const int32_t* tok = slot_mtp[(size_t) b]->chain_tok();
+                const float* prob = slot_mtp[(size_t) b]->chain_prob();
+                sl.n_drafts = std::clamp(sl.chain_n, 1, pm_drafts);
+                for (int j = 0; j < sl.n_drafts; ++j) {
+                    sl.draft[(size_t) j] = tok[j];
+                    sl.dprob[(size_t) j] = prob[j];
+                }
+                sl.n_prob = sl.n_drafts;
+                sl.draft_ready = true;
+                return 1;
+            }
             // the first proposal always; another while the draft layer was at least --spec-min-p sure of the one before
             // (the solo path's rule, MtpDrafter::draft)
             BSlot& sl = bs[(size_t) b];
@@ -13147,6 +13193,8 @@ int main(int argc, char** argv) {
                        !is_eos(outb[f + blk.keep - 1]))
                     ++blk.keep;
                 keep[(size_t) b] = blk.keep;
+                if (sws && !sl.stop && sl.n_ver == blk.n - 1 && blk.n > 1)   // STRATA_SWARM_SPEC: the calibration learns
+                    swarm.observe_probs(sl.vprob.data(), blk.n - 1, blk.keep - 1);
                 bt_accepted += blk.keep - 1;
                 bt_tokens += blk.n - 1;   // (proposals checked)
                 blks.push_back(blk);
@@ -13207,13 +13255,20 @@ int main(int argc, char** argv) {
                 if (!sl.active) continue;   // it ended: no more drafts for it
                 const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) blk.b]->device());
                 sl.draft_ready = false;
+                // (STRATA_SWARM_SPEC=2: the chain one step past the proposals this window verified; else all pm_drafts)
+                const int n_out = sws == 2 ? std::clamp(blk.n, 1, pm_drafts) : pm_drafts;
+                if (sws) {
+                    sl.chain_n = n_out;
+                    sl.chain_t0 = Clock::now();
+                    sl.chain_waited = false;
+                }
                 const float* src = vk.final_R_all() + (size_t) blk.f * stride;
                 if (cudaMemcpyAsync(slot_mtp_rows[(size_t) blk.b].get(), src, (size_t) blk.n * stride * sizeof(float),
                                     cudaMemcpyDeviceToDevice, vk.stream()) != cudaSuccess ||
                     cudaEventRecord(pm_copied[(size_t) blk.b], vk.stream()) != cudaSuccess ||
                     cudaStreamWaitEvent(slot_mtp[(size_t) blk.b]->stream(), pm_copied[(size_t) blk.b], 0) != cudaSuccess ||
                     !slot_mtp[(size_t) blk.b]->chain_launch(blk.n, outb + blk.f, G.pos[blk.f], blk.keep - 1, nullptr, 0,
-                                                            pm_drafts, 0, err)) {
+                                                            n_out, 0, err)) {
                     std::printf("ERR batch MTP slot %d: %s\n", blk.b,
                                 err.empty() ? "the proposal's chain did not start" : err.c_str());
                     return false;
@@ -13296,6 +13351,9 @@ int main(int argc, char** argv) {
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
                 p4.done(k, gi);
+                if (sws && sw_stage_rows[(size_t) k] > 0)   // STRATA_SWARM_SPEC: the window's time on this stage
+                    swarm.observe_stage(k, sw_stage_rows[(size_t) k],
+                                        std::chrono::duration<double, std::milli>(Clock::now() - sw_stage_t0[(size_t) k]).count());
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
                 PGroup& G = pg[(size_t) gi];
@@ -13387,18 +13445,53 @@ int main(int argc, char** argv) {
                         G.hbase = pmtp_rows_per_group * pick;
                         G.S = 0;
                         G.active = 0;
+                        // STRATA_SWARM_SPEC: one schedule over every active slot - this group's with the proposals its
+                        // chains just gave, the others' with the latest their chains gave (the ones in flight still
+                        // verify their last ones) - and this group's slots take their counts from it
+                        std::array<int, strata::spec::SwarmSchedule::kMaxSlots> sw_nd{};
+                        if (sws) {
+                            std::array<strata::spec::SwarmSchedule::Slot, strata::spec::SwarmSchedule::kMaxSlots> sw_in{};
+                            std::array<int, strata::spec::SwarmSchedule::kMaxSlots> sw_b{}, sw_out{};
+                            int n_in = 0;
+                            for (int b = 0; b < (int) bs.size() && n_in < strata::spec::SwarmSchedule::kMaxSlots; ++b) {
+                                const BSlot& sl = bs[(size_t) b];
+                                if (!sl.active) continue;
+                                strata::spec::SwarmSchedule::Slot& x = sw_in[(size_t) n_in];
+                                x.group = b / GS;
+                                const int64_t room = std::min<int64_t>(sl.max_new - sl.produced - 1, o.max_context - sl.p - 2);
+                                const int have = b / GS == pick ? (sl.draft_ready ? sl.n_drafts : 0) : pm_drafts;
+                                x.cap = sl.stop ? 0 : (int) std::max<int64_t>(0, std::min<int64_t>(have, room));
+                                x.n_p = std::min(sl.n_prob, strata::spec::SwarmSchedule::kMaxDrafts);
+                                for (int j = 0; j < x.n_p; ++j) x.p[j] = sl.dprob[(size_t) j];
+                                sw_b[(size_t) n_in++] = b;
+                            }
+                            const auto plan = swarm.plan(sw_in.data(), n_in, (int) pg.size(), sw_out.data());
+                            for (int i = 0; i < n_in; ++i) sw_nd[(size_t) sw_b[(size_t) i]] = sw_out[(size_t) i];
+                            ++sw_plans;
+                            sw_model += plan.tok_per_ms;
+                        }
                         for (int t = 0; t < GS; ++t) {
                             const int b = pick * GS + t;
                             const BSlot& sl = bs[(size_t) b];
                             if (!sl.active) continue;   // an idle slot carries no row (its state is left untouched)
+                            BSlot& sl_sw = bs[(size_t) b];   // (STRATA_SWARM_SPEC notes what the window verifies)
                             ++G.active;
                             G.rows[G.S] = b;
                             G.tok[G.S] = sl.x;
                             G.pos[G.S] = sl.p;
                             ++G.S;
                             int nd = sl.draft_ready && !sl.stop ? sl.n_drafts : 0;
+                            if (sws) nd = std::min(nd, sw_nd[(size_t) b]);
                             nd = (int) std::min<int64_t>(nd, std::min<int64_t>(sl.max_new - sl.produced - 1,
                                                                                 o.max_context - sl.p - 2));
+                            if (sws) {   // the probabilities of what this window verifies (the calibration, at the verdict)
+                                nd = std::max(nd, 0);
+                                sl_sw.n_ver = nd;
+                                for (int j = 0; j < nd; ++j) sl_sw.vprob[(size_t) j] = sl.dprob[(size_t) j];
+                                ++sw_slot_windows;
+                                sw_props += nd;
+                                if (nd == 0) ++sw_zero;
+                            }
                             for (int j = 0; j < nd; ++j) {
                                 G.rows[G.S] = b;
                                 G.tok[G.S] = sl.draft[(size_t) j];
@@ -13442,6 +13535,10 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 p4.launched(k, pick, p4_l0);
+                if (sws) {   // (from the launch's return: a first use's graph capture is not the window's time)
+                    sw_stage_t0[(size_t) k] = Clock::now();
+                    sw_stage_rows[(size_t) k] = G.S;
+                }
                 stage_group[(size_t) k] = pick;
                 if (conc_serving) {   // the doorbell thread may be waiting between windows: the launch above is seen
                     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -13490,6 +13587,17 @@ int main(int argc, char** argv) {
                 if (pmtp)
                     std::fprintf(stderr, " (%lld of %lld MTP proposals kept)", (long long) bt_accepted, (long long) bt_tokens);
                 std::fprintf(stderr, "\n");
+                if (sws && sw_plans > 0) {   // STRATA_SWARM_SPEC: what the schedule chose and the costs it chose by
+                    std::fprintf(stderr, "strata batch STRATA_SWARM_SPEC=%d: %lld group windows planned, %.2f proposals per "
+                                         "slot window (%.0f%% with none), model %.3f tokens/ms; calibration rate(p~0.55) %.2f "
+                                         "rate(p~0.75) %.2f rate(p~0.95) %.2f; %s\n", sws, (long long) sw_plans,
+                                 sw_slot_windows > 0 ? (double) sw_props / (double) sw_slot_windows : 0.0,
+                                 sw_slot_windows > 0 ? 100.0 * (double) sw_zero / (double) sw_slot_windows : 0.0,
+                                 sw_model / (double) sw_plans, swarm.rate(0.55), swarm.rate(0.75), swarm.rate(0.95),
+                                 swarm.cost_text().c_str());
+                    sw_plans = sw_slot_windows = sw_props = sw_zero = 0;
+                    sw_model = 0.0;
+                }
                 p4.flush();
                 pa_rounds = pa_swaps = 0;
                 pa_ms = 0;
@@ -17399,15 +17507,24 @@ int main(int argc, char** argv) {
                     sl.ids = live;
                     if (batch_mtp) {
                         int nd = 1;   // (STRATA_PIPED_MTP: up to its proposals per window, as --spec-min-p allows)
+                        // (STRATA_SWARM_SPEC: every proposal and its probability - the schedule picks at the launch)
+                        float sw_prob[32] = {};
                         if (!slot_mtp[(size_t) admit_slot]->draft_first(1, ver.final_R_all(), sl.x,
-                                                                        sl.p - 1, sl.draft.data(), err, nullptr,
-                                                                        piped_mtp ? (float) o.spec_min_p : 0.0f, &nd)) {
+                                                                        sl.p - 1, sl.draft.data(), err, sws ? sw_prob : nullptr,
+                                                                        piped_mtp && !sws ? (float) o.spec_min_p : 0.0f, &nd)) {
                             std::fprintf(stderr, "strata batch: MTP admission for slot %d failed: %s\n",
                                          admit_slot, err.c_str());
                             return 1;
                         }
                         sl.n_drafts = std::max(1, nd);
                         sl.draft_ready = true;
+                        if (sws) {
+                            sl.n_prob = std::clamp(nd, 0, (int) sl.dprob.size());
+                            for (int j = 0; j < sl.n_prob; ++j) sl.dprob[(size_t) j] = sw_prob[j];
+                            sl.n_ver = 0;
+                            sl.chain_n = 0;
+                            sl.chain_waited = false;
+                        }
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
