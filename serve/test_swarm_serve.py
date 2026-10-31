@@ -70,6 +70,24 @@ class Defaults(unittest.TestCase):
             self.assertEqual(StrataEngine._mirror_limits(["--batch", "8"])[0], 3)
 
 
+class FromTheRunConfig(unittest.TestCase):
+    def test_the_config_env_turns_them_on(self):
+        """The run config's "env" block (the engine's environment) turns the options on for a swarm profile; it also
+        gives STRATA_ADMIT_SHORT_FIRST / STRATA_SLOT_KEEP_MIN then, and only then (an older config is unchanged)."""
+        e = engine()
+        e._swarm_config({"STRATA_ADMIT_SHORT_FIRST": "4096", "STRATA_SLOT_KEEP_MIN": "100"})
+        self.assertEqual((e._uncached_on(), e._affinity_on(), e._short_first(), e._keep_min()), (False, False, 0, 4096))
+        e._swarm_config({"STRATA_ADMIT_UNCACHED": "1", "STRATA_ADMIT_SHORT_FIRST": "4096",
+                         "STRATA_SLOT_AFFINITY": "1", "STRATA_SLOT_KEEP_MIN": "100"})
+        self.assertEqual((e._uncached_on(), e._affinity_on(), e._short_first(), e._keep_min()), (True, True, 4096, 100))
+        self.assertEqual(e._admit_len(conv(1, 3000))[0], 3000)
+        e._mirror_note(conv(1, 3000))
+        self.assertEqual(e._admit_len(conv(1, 3000) + [1, 2])[0], 2)
+        self.assertTrue(e.swarm_view()["admit_uncached"])
+        e._swarm_config({"STRATA_ADMIT_UNCACHED": "0", "STRATA_SLOT_AFFINITY": ""})
+        self.assertIsNone(e.swarm_view())
+
+
 class ServedPrefix(unittest.TestCase):
     def test_lists_and_arrays_agree(self):
         e = engine()

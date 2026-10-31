@@ -1282,12 +1282,13 @@ class StrataEngine:
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         # STRATA_ADMIT_UNCACHED: the mirror of the streams this engine process holds (a new process holds none)
+        self._swarm_config(env if env is not None else os.environ)
         self._mirror, self._mirror_cap, self._mirror_min = [], *self._mirror_limits(args)
         self.swarm_stats = {"estimates": 0, "est_hit_tokens": 0, "reused_tokens": 0, "overestimates": 0,
                             "mirror_dropped": 0}
-        if self.batch and (ADMIT_UNCACHED or SLOT_AFFINITY):
-            print(f"[strata] swarm serving: admission by uncached length {'on' if ADMIT_UNCACHED else 'off'} "
-                  f"(mirror {self._mirror_cap} streams), slot affinity {'on' if SLOT_AFFINITY else 'off'}", flush=True)
+        if self.batch and (self._uncached_on() or self._affinity_on()):
+            print(f"[strata] swarm serving: admission by uncached length {'on' if self._uncached_on() else 'off'} "
+                  f"(mirror {self._mirror_cap} streams), slot affinity {'on' if self._affinity_on() else 'off'}", flush=True)
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
@@ -1947,11 +1948,11 @@ class StrataEngine:
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
                 with self.slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
-                    if turn and new and ADMIT_SHORT_FIRST > 0:
+                    if turn and new and self._short_first() > 0:
                         turn = self._admit_next() is entry
                 left = deadline - time.monotonic() if deadline is not None else 0.5
                 if turn and left > 0 and self.ctl.acquire(timeout=min(0.5, left)):
-                    if new and ADMIT_SHORT_FIRST > 0:
+                    if new and self._short_first() > 0:
                         with self.slot_cv:              # a shorter one came while this one waited in acquire()
                             first = self._admit_next() is entry
                         if not first:
@@ -2045,11 +2046,11 @@ class StrataEngine:
         each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
         Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read.
         (With STRATA_ADMIT_UNCACHED the lengths are what the engine will read: the prompt minus its cached start.)"""
-        now = time.monotonic()
+        now, first = time.monotonic(), self._short_first()
         ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
         if not ordered:
             return None
-        return min(ordered, key=lambda e: (0 if e[0] <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
+        return min(ordered, key=lambda e: (0 if e[0] <= first or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
                                            e[1]))
 
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
@@ -2072,6 +2073,36 @@ class StrataEngine:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
     # --- swarm serving (STRATA_ADMIT_UNCACHED, STRATA_SLOT_AFFINITY; both opt-in) ---
+    # Each is on when this server's environment sets it, or the run config's "env" block (the engine's environment,
+    # read at start): a swarm profile carries them in its config.  STRATA_ADMIT_SHORT_FIRST and STRATA_SLOT_KEEP_MIN
+    # are taken from the config too, but only for a config that turns these on (an older config keeps its behaviour).
+
+    def _swarm_config(self, env) -> None:
+        """At engine start: the swarm options a run config's "env" block sets (see above)."""
+        def on(k):
+            return (str(env.get(k) or "0")).strip() not in ("", "0")
+
+        def num(k, default):
+            try:
+                return max(0, int(env.get(k) or default))
+            except (TypeError, ValueError):
+                return default
+        env = env or {}
+        self._uncached_cfg, self._affinity_cfg = on("STRATA_ADMIT_UNCACHED"), on("STRATA_SLOT_AFFINITY")
+        self._short_first_cfg = num("STRATA_ADMIT_SHORT_FIRST", 0) if self._uncached_cfg else 0
+        self._keep_min_cfg = num("STRATA_SLOT_KEEP_MIN", SLOT_KEEP_MIN) if self._affinity_cfg else SLOT_KEEP_MIN
+
+    def _uncached_on(self) -> bool:
+        return ADMIT_UNCACHED or self.__dict__.get("_uncached_cfg", False)
+
+    def _affinity_on(self) -> bool:
+        return SLOT_AFFINITY or self.__dict__.get("_affinity_cfg", False)
+
+    def _short_first(self) -> int:
+        return ADMIT_SHORT_FIRST or self.__dict__.get("_short_first_cfg", 0)
+
+    def _keep_min(self) -> int:
+        return self.__dict__.get("_keep_min_cfg", SLOT_KEEP_MIN)
 
     @staticmethod
     def _mirror_limits(args) -> tuple[int, int]:
@@ -2150,7 +2181,7 @@ class StrataEngine:
         """(the length the admission order and the give-way rule compare, the cache hit it assumes): the whole length,
         or with STRATA_ADMIT_UNCACHED what the engine will read (the length minus the cached start)."""
         n = len(prompt)
-        if not ADMIT_UNCACHED or n < 2:
+        if not self._uncached_on() or n < 2:
             return n, 0
         try:
             hit = min(self._cache_hit(prompt), n - 1)
@@ -2168,7 +2199,7 @@ class StrataEngine:
         conversation (streams it continues, at least up to their second half: not another agent's stream that only
         shares the system prompt); the oldest go first past the mirror's size."""
         mirror = self.__dict__.get("_mirror")
-        if not ADMIT_UNCACHED or mirror is None or len(stream) < getattr(self, "_mirror_min", 256):
+        if not self._uncached_on() or mirror is None or len(stream) < getattr(self, "_mirror_min", 256):
             return
         try:
             a = array("i", stream)
@@ -2187,7 +2218,7 @@ class StrataEngine:
         did not meet came from a stream the engine no longer holds (evicted from the conversation cache, a slot written
         over): the mirror's streams that promised it go."""
         st = self.__dict__.get("swarm_stats")
-        if not ADMIT_UNCACHED or reused is None or st is None:
+        if not self._uncached_on() or reused is None or st is None:
             return
         reused = int(reused)
         st["reused_tokens"] += reused
@@ -2212,7 +2243,7 @@ class StrataEngine:
         start of `prompt` itself: its own conversation goes on there); 2: the start of a prompt waiting for a slot;
         1: any other conversation."""
         h = self.slot_held[b]
-        if not h or len(h) < SLOT_KEEP_MIN or self._same_conversation(h, prompt):
+        if not h or len(h) < self._keep_min() or self._same_conversation(h, prompt):
             return 0
         for w in wanted:
             if self._same_conversation(h, w):
@@ -2228,12 +2259,12 @@ class StrataEngine:
 
     def swarm_view(self) -> dict | None:
         """/metrics: the swarm serving options and how the admission estimates met the engine (None: both off)."""
-        if not (ADMIT_UNCACHED or SLOT_AFFINITY):
+        if not (self._uncached_on() or self._affinity_on()):
             return None
         mirror = self.__dict__.get("_mirror") or []
         with _MIRROR_LOCK:
             n, toks = len(mirror), sum(len(h) for h in mirror)
-        return {"admit_uncached": ADMIT_UNCACHED, "slot_affinity": SLOT_AFFINITY, "mirror_streams": n,
+        return {"admit_uncached": self._uncached_on(), "slot_affinity": self._affinity_on(), "mirror_streams": n,
                 "mirror_tokens": toks, **dict(self.__dict__.get("swarm_stats") or {})}
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -2286,13 +2317,13 @@ class StrataEngine:
 
         def feedback():
             # STRATA_ADMIT_UNCACHED: the engine's reused count for the prompt just read, against the estimate
-            if ADMIT_UNCACHED and not est["fed"] and est["n"] == len(prompt) and self._yielded is None:
+            if self._uncached_on() and not est["fed"] and est["n"] == len(prompt) and self._yielded is None:
                 est["fed"] = True
                 self._mirror_feedback(prompt, est["hit"], (self.last or {}).get("reused"))
 
         def want(on):
             # STRATA_SLOT_AFFINITY: this request's prompt among those waiting for a slot (pick_slot keeps their slots)
-            if SLOT_AFFINITY:
+            if self._affinity_on():
                 with self.slot_cv:
                     wanted = self.__dict__.setdefault("slot_wanted", {})
                     if on:
@@ -2445,7 +2476,7 @@ class StrataEngine:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
                                     self.__dict__.get("slot_wanted", {}).pop(cancel, None)
-                                    if ((ADMIT_UNCACHED or SLOT_AFFINITY) and getattr(self, "slot_gs", 0) > 1 and
+                                    if ((self._uncached_on() or self._affinity_on()) and getattr(self, "slot_gs", 0) > 1 and
                                             not getattr(self, "slot_padding_safe", False)):
                                         # a pipelined group's pad rows write its idle slots below this one: what they
                                         # held is gone (pick_slot), so the estimates and the choice no longer count it
@@ -2680,7 +2711,7 @@ class StrataEngine:
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
             want(False)
-            if ADMIT_UNCACHED and out and not spoiled and self.gen == born:
+            if self._uncached_on() and out and not spoiled and self.gen == born:
                 self._mirror_note(list(ids) + out[:-1])  # what its slot / the main session holds now (then parked)
             try:
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
@@ -2842,7 +2873,7 @@ class StrataEngine:
             def fills_hole(b):
                 g0 = b - b % gs
                 return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
-            if not SLOT_AFFINITY:
+            if not self._affinity_on():
                 return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
             # STRATA_SLOT_AFFINITY: holes first as above, then the groups with the fewest busy slots, and among those
             # the slot whose admission writes over the conversations least worth keeping: its own and those of the
@@ -2888,7 +2919,7 @@ class StrataEngine:
             if now - self.slot_used[b] >= self.SLOT_EXPIRE_S:
                 return 1, 0
             return 2, len(h)
-        if SLOT_AFFINITY:
+        if self._affinity_on():
             # ... with STRATA_SLOT_AFFINITY the slot whose conversation is least worth keeping before the least recent
             # (see _slot_keep: a short side request's, one held again elsewhere; a waiting agent's start comes last)
             wanted = self._slot_wanted(me)
