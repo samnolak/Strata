@@ -2253,6 +2253,11 @@ class StrataEngine:
                 return 0
         return 1
 
+    def _pick_for(self, prompt, me):
+        """pick_slot for a request (the caller holds slot_cv); with STRATA_SLOT_AFFINITY it says which request asks
+        (`me`: its own prompt is not one to keep a slot for).  Off: the call as before."""
+        return self.pick_slot(prompt, me) if self._affinity_on() else self.pick_slot(prompt)
+
     def _slot_wanted(self, me) -> list:
         """STRATA_SLOT_AFFINITY: the prompts of the other requests that wait for a slot (the caller holds slot_cv)."""
         return [p for k, p in self.__dict__.get("slot_wanted", {}).items() if k is not me]
@@ -2359,7 +2364,7 @@ class StrataEngine:
 
         def choose_slot():
             nonlocal slot_plan
-            chosen = self.pick_slot(prompt, cancel)
+            chosen = self._pick_for(prompt, cancel)
             slot_plan = getattr(self, "slot_last_plan", None)   # (the caller holds slot_cv)
             return chosen
         try:
@@ -2406,7 +2411,7 @@ class StrataEngine:
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(alen())):
                             with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt, cancel)
+                                reserved = self._pick_for(prompt, cancel)
                                 slot_plan = getattr(self, "slot_last_plan", None)
                                 if reserved is not None:
                                     self.slot_busy[reserved] = True
