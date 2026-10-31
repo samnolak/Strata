@@ -2288,8 +2288,15 @@ if(STRATA_NATIVE_EXPERTS)
     if(_strata_mmq_tab_on)
       set(_strata_tab_cuh ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_mmq_tab.cuh)
       # the native packs' nine types, the ones prefill_mmq_tab_test checks bit for bit; the optional Q5_0 / K-quant
-      # instances (STRATA_ORCA_Q4KS_MMQ, STRATA_MMQ_KQUANTS) get no pointer table and keep the gather
+      # instances (STRATA_ORCA_Q4KS_MMQ, STRATA_MMQ_KQUANTS) get no pointer table and keep the gather - except Q6_K with
+      # STRATA_MMQ_KQUANTS (UD-Q6_K_XL: Q6_K gate/up + Q8_0 down, both then read in place; prefill_mmq_tab_test checks it
+      # against the gathered product of strata_kq, the same mmq.cuh templates built with the same flags).  Its instance
+      # lives here, not in strata_kq: run_tab is in this library (+~4 MiB of VRAM per GPU in a STRATA_MMQ_TAB build)
       set(_strata_mmq_tab_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+      if(STRATA_MMQ_KQUANTS)
+        list(APPEND _strata_mmq_tab_types q6_k)
+        target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TAB_Q6K=1)
+      endif()
       foreach(_t IN LISTS _strata_mmq_tab_types)
         string(TOUPPER ${_t} _strata_tab_T)
         configure_file(src/prefill/mmq_tab_instance.cu.in ${CMAKE_BINARY_DIR}/mmq_tab/mmq-tab-${_t}.cu @ONLY)
@@ -2407,7 +2414,8 @@ if(STRATA_NATIVE_EXPERTS)
       add_executable(prefill_mmq_tab_test tests/cuda/prefill_mmq_tab_test.cu)
       target_link_libraries(prefill_mmq_tab_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_mmq_tab_test COMMAND prefill_mmq_tab_test)
-      set_tests_properties(prefill_mmq_tab_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # STRATA_MMQ_KQ=1: the gathered Q6_K reference runs in strata_kq (next to the test), and Q6_K's table needs it on
+      set_tests_properties(prefill_mmq_tab_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 ENVIRONMENT STRATA_MMQ_KQ=1)
     endif()
     if(STRATA_BUILD_TESTS AND STRATA_MMQ_KQUANTS)
       # the UD-Q4_K_XL expert formats through MMQ against ggml's dequantized weights (synthetic, a few seconds)
