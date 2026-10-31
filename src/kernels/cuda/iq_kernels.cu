@@ -905,7 +905,12 @@ template<int TY> inline constexpr bool kSplit = false;
 // run only with STRATA_KQ_SPLIT=1 until the A/B on the measured cards decides (bitwise the old kernels either way).
 template<int TY> inline constexpr bool kq_type = (TY == 12 || TY == 13 || TY == 8);   // not Q5_1: its Split apply is not bitwise the old dot (FMA contraction), see notes-151-amd
 inline bool g_kq_split = [] { const char* v = std::getenv("STRATA_KQ_SPLIT"); return v != nullptr && v[0] == '1'; }();
-template<int TY> inline bool split_off() { return kq_type<TY> && !g_kq_split; }
+// Q6_K (Split<14> below) has a switch of its own, STRATA_Q6K_SPLIT=1, off by default like STRATA_KQ_SPLIT (bitwise either way)
+inline bool g_q6k_split = [] { const char* v = std::getenv("STRATA_Q6K_SPLIT"); return v != nullptr && v[0] == '1'; }();
+template<int TY> inline bool split_off() {
+    if constexpr (TY == 14) return !g_q6k_split;
+    else return kq_type<TY> && !g_kq_split;
+}
 template<int TY> inline constexpr bool kTqType = (TY == 144 || TY == 145 || TY == 146);
 // the trellis types stage their int8 codebook (4 KB) too, but only where it pays: tq_stage_on() below (compute capability 6.0)
 template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 21 || TY == 22 || TY == 29 || kTqType<TY>);
@@ -1420,6 +1425,55 @@ template<> inline constexpr bool kSplit<8> = true;
 template<> struct Split<12> : SplitK<12> {};
 template<> struct Split<13> : SplitK<13> {};
 template<> struct Split<8> : SplitK<8> {};
+// Q6_K (UD-Q6_K_XL / UD-Q5_K_XL gate/up, Qwen3.6-35B's Q6_K downs): vec_dot_q6_K_q8_1 above, split the way native_mmvq.cu's
+// B6X<Q6KTraits> splits it (weight side: the ql / qh words, the two int8 scales and the fp16 block scale as a float;
+// activation side: the two q8_1 words and ds.low, then q6_q8_dot_impl's chain) - here with this file's own blocks and
+// STRATA_DP4A, in this TU's flags (no fast-math), as Fmt<14>::dot.  apply(load(...)) runs vec_dot_q6_K_q8_1_impl_mmvq's
+// operations on the same values in the same order: per i, vi = __vsubss4(vil | vih, 0x20202020), the int product
+// dp4a(vi, u[i], 0) * sc[i], sumf += d8[i] * (float) that, then d * sumf.  So each (row, entry) is bitwise the per-entry
+// native_gu_kernel<14> / native_down_kernel<14> (iq_multi_parity, STRATA_Q6K_SPLIT=1).  OPT-IN: the decode-once kernels
+// run for Q6_K only with STRATA_Q6K_SPLIT=1 (split_off above), independent of STRATA_KQ_SPLIT, so the two A/B separately.
+template<> inline constexpr bool kSplit<14> = true;
+template<> struct Split<14> {
+    struct W { int vl, vh, sc[QR6_K]; float d; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_q6_K* bq6_K = (const block_q6_K*) vbq + kbx;
+        const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+        const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+        W r;
+        r.vl = get_int_b2(bq6_K->ql, iqs);
+        r.vh = get_int_b2(bq6_K->qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+#pragma unroll
+        for (int i = 0; i < QR6_K; ++i) r.sc[i] = bq6_K->scales[scale_offset + 4 * i];   // the impl's scales[4 * i]
+        r.d = __half2float(bq6_K->d);
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+        int u[QR6_K];
+        float d8[QR6_K];
+#pragma unroll
+        for (int i = 0; i < QR6_K; ++i) {
+            u[i] = get_int_b4(bq8_1[bq8_offset + 2 * i].qs, iqs % QI8_1);
+            d8[i] = __low2float(bq8_1[bq8_offset + 2 * i].ds);
+        }
+        float sumf = 0.0f;   // vec_dot_q6_K_q8_1_impl_mmvq with the scales already in registers
+#pragma unroll
+        for (int i = 0; i < QR6_K; ++i) {
+            const int sc = r.sc[i];
+            const int vil = (r.vl >> (4 * i)) & 0x0F0F0F0F;
+            const int vih = ((r.vh >> (4 * i)) << 4) & 0x30303030;
+            const int vi = __vsubss4(vil | vih, 0x20202020);   // vi = (vil | vih) - 32
+            sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
+        }
+        return r.d * sumf;
+    }
+};
+// A Q6_K row has n / 8 calls (VDR 1: 32 per 256 values), 320 at n_embd 2560: never the 80 of the 16-lane gate/up rows,
+// which also need n_embd == 2560 (xb == 80).  So launch_gu / launch_gu_swiglu instantiate only the full-warp multi kernel
+// for it, and native_expert_grouped sizes its grid for 8 rows a block (gu_sub16_rows).
+static_assert((2560 / Fmt<14>::qk) * Fmt<14>::ipb == 320, "Q6_K: 32 calls of VDR 1 per 256 values");
 template<> inline constexpr bool kSplit<40> = true;
 template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1's two 16-value sub-blocks, weights decoded once per call
     struct W { int2 v0[2], v1[2]; float sc[2]; };
@@ -4210,6 +4264,8 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
     const bool g_no_sub16_gu = ::strata::kernels::g_no_sub16_gu || (L.n_embd / Fmt<TG>::qk) * Fmt<TG>::ipb != 80;
     if constexpr (!kSplit<TG>) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if (g_old_kernels || split_off<TG>()) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    else if constexpr (TG == 14)   // Q6_K (STRATA_Q6K_SPLIT=1): never 80 calls a row (Split<14>), the full-warp rows only
+        native_gu_multi_kernel<14, false, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if constexpr (kStageIqGrid<TG>) {
         if constexpr (TG == 144 || TG == 145) {   // tq_sub8_on: the 8-lane trellis rows, 32 rows a block
             if (tq_sub8_on() && (L.n_embd / Fmt<TG>::qk) * Fmt<TG>::ipb == 160) {
@@ -4261,7 +4317,7 @@ template<int TG>
 bool launch_gu_swiglu(const NativeExpertLayout& L, int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr,
                       const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X,
                       block_q8_1* hq) {
-    if constexpr (!kSplit<TG>) {
+    if constexpr (!kSplit<TG> || TG == 14) {   // Q6_K: 320 calls a row at n_embd 2560, never the 16-lane rows (Split<14>)
         return false;
     } else {
         if (g_old_kernels || split_off<TG>() || g_no_sub16_gu || L.n_embd != 2560 || L.n_ff % 32 != 0 || L.n_ff <= 0) return false;
@@ -4288,6 +4344,8 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
                  float* out) {
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels || split_off<TD>()) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else if constexpr (TD == 14)   // Q6_K down (Qwen3.6-35B, STRATA_Q6K_SPLIT=1): no 8/16-lane down rows exist for it, one instance
+        native_down_multi_kernel<14, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if constexpr (kTqType<TD>) {   // the trellis down types: the codebook staged where tq_stage_on() or tq_sub8_on()
         if (tq_stage_on() || tq_sub8_on()) {
             if (g_no_sub16_gu) native_down_multi_kernel<TD, false, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
@@ -6334,9 +6392,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // gu_sub16_rows: launch_gu takes the 16-row (16-lane) kernel only for a split format whose rows have exactly 80 calls
     // (native_gu_multi_kernel: xb == 80 && nb * ipb == 80); every other row shape runs its full-warp rows, 8 a block, in
     // ONE pass over blockIdx.x, so a 16-row grid there computed only rows 0 .. n_ff - 1 (the gate) and never the up rows.
-    // That was the case of Q8_0 gate/up (320 calls at 2560; UD-Q6_K_XL layer 2, the rt-q8 drafter) with STRATA_KQ_SPLIT=1;
-    // the old test (qk != 128, not Q4_K / Q5_K) gives the same 16 / 8 as this one for every other split type (IQ*, Q2_0,
-    // NVFP4: 80 calls; Q4_K / Q5_K / APR trellis: 160).
+    // That was the case of Q8_0 gate/up (320 calls at 2560; UD-Q6_K_XL layer 2, the rt-q8 drafter) with STRATA_KQ_SPLIT=1,
+    // and of Q6_K (320) with STRATA_Q6K_SPLIT=1; the old test (qk != 128, not Q4_K / Q5_K) gave the same 16 / 8 for every
+    // other split type (IQ*, Q2_0, NVFP4: 80 calls; Q4_K / Q5_K / APR trellis: 160).
     const bool gu_sub16_rows = !g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type) &&
                                gu_calls(L.gu_type, L.n_embd) == 80;
     const int gu_rows = gu_sub16_rows ? 16 : GU_ROWS;
