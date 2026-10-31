@@ -2311,8 +2311,9 @@ class StrataEngine:
             # the length the admission order and the give-way rule compare: the whole prompt, or with
             # STRATA_ADMIT_UNCACHED what the engine will read of it (estimated once per prompt: it only grows)
             if est["n"] != len(prompt):
-                est["len"], est["hit"] = self._admit_len(prompt)
-                est["n"], est["fed"] = len(prompt), False
+                # (a prompt with pictures: the engine's slot sources take text only - no estimate, its whole length)
+                est["len"], est["hit"] = self._admit_len(prompt) if not embeddings else (len(prompt), 0)
+                est["n"], est["fed"] = len(prompt), bool(embeddings)
             return est["len"]
 
         def feedback():
@@ -2711,7 +2712,7 @@ class StrataEngine:
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
             want(False)
-            if self._uncached_on() and out and not spoiled and self.gen == born:
+            if self._uncached_on() and out and not spoiled and not embeddings and self.gen == born:
                 self._mirror_note(list(ids) + out[:-1])  # what its slot / the main session holds now (then parked)
             try:
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
