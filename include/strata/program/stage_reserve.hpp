@@ -25,13 +25,14 @@ struct Inputs {
     bool drafter = false;           ///< the stage that carries the MTP drafter and the head
     int64_t pipe_window_mib = 0;    ///< --pipeline-windows: a second verifier on every stage
     int64_t pipe_snap_mib = 0;      ///< --pipeline-windows 2 or more: the first stage's second GDN state
+    int64_t extra_snap_mib = 0;     ///< --pipeline-windows 3 on more than two stages: a later front stage's snapshots
     int64_t drafter_extra_mib = 0;  ///< p/mtp-q8: the drafter's experts beyond kDrafterMib's Q2_0 (Q8_0: +1,875 MiB), drafter stage only
 };
 
 /// What the plan keeps free on the card, in MiB (generate.cpp's `reserve` before the shift).
 inline int64_t reserve_mib(const Inputs& in) {
     return in.base_reserve_mib + in.prompt_buffers_mib + (in.later ? kWindowMib : in.pipe_snap_mib) + in.pipe_window_mib +
-           (in.drafter ? kDrafterMib + in.drafter_extra_mib : 0);
+           (in.drafter ? kDrafterMib + in.drafter_extra_mib : 0) + in.extra_snap_mib;
 }
 
 /// The room the cache may use: the free bytes less the reserve, never below 0.
