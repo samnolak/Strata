@@ -51,7 +51,7 @@ public:
     double draft_wait_ms() const { return d_n_ > 0 ? d_ : 0.0; }
 
     // ---- calibration (DraftPolicy::observe_probs / draft_rate: the measured acceptance by draft probability)
-    void observe_probs(const float* p, int n_verified, int accepted) { cal_.observe_probs(p, n_verified, accepted); }
+    void observe_probs(const float* p, int n_verified, int accepted);
     double rate(double p) const { return cal_.draft_rate(p); }
 
     // ---- the plan

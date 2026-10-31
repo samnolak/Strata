@@ -113,6 +113,10 @@ int main() {
         int n1[1];
         t.plan(&x, 1, 1, n1);
         check(n1[0] == 1, "a likely first proposal, an unlikely second: the first only");
+        SwarmSchedule::Slot y = slot(0, 3, 0.9, 3);
+        y.p[0] = std::nanf("");
+        t.plan(&y, 1, 1, n1);
+        check(n1[0] == 0, "a NaN probability: no chance, and nothing after it");
     }
     {
         SwarmSchedule s(2);

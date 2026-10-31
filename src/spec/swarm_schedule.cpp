@@ -83,6 +83,13 @@ double SwarmSchedule::stage_ms(int stage, int rows) const {
     return std::max(my + b * (rows - mx), 0.25 * cmin);
 }
 
+void SwarmSchedule::observe_probs(const float* p, int n_verified, int accepted) {
+    float q[DraftPolicy::kMaxT] = {};
+    n_verified = std::clamp(n_verified, 0, DraftPolicy::kMaxT);
+    for (int j = 0; j < n_verified; ++j) q[j] = p[j] >= 0.0f ? std::min(p[j], 1.0f) : 0.0f;   // (NaN: 0)
+    cal_.observe_probs(q, n_verified, std::clamp(accepted, 0, n_verified));
+}
+
 double SwarmSchedule::round_ms(const int* rows, int n_groups) const {
     double full = 0.0, trip = 0.0;
     for (int k = 0; k < n_stages_; ++k) {
@@ -117,7 +124,9 @@ SwarmSchedule::Plan SwarmSchedule::plan(const Slot* slots, int n_slots, int n_gr
         const int lim = std::min({slots[s].cap, slots[s].n_p, kMaxDrafts, kMaxRows - 1});
         double a = 1.0;
         for (int j = 0; j < lim; ++j) {
-            a *= std::clamp(rate((double) slots[s].p[j]), 0.0, 1.0);
+            double pj = (double) slots[s].p[j];
+            if (!(pj >= 0.0)) pj = 0.0;   // (NaN or negative from the device: no chance; a total order for the sort)
+            a *= std::clamp(rate(std::min(pj, 1.0)), 0.0, 1.0);
             cand[(size_t) nc++] = Cand{a, s, j};
         }
     }

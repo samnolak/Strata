@@ -536,6 +536,26 @@ run without it; inside one run every slot still equals its own solo decode.
 Not run: AMD (HIP), the draft layer on the first stage, helper expert caches, more than two stages, SYCL (the SYCL
 tree has its own copy of the batch code and does not have this).
 
+## One schedule for every slot's proposals (`STRATA_SWARM_SPEC`, opt-in, not measured yet)
+
+With `STRATA_PIPED_MTP=N` each slot decides alone how many of its N proposals its group's window verifies (the first
+always, more while the draft layer is at least `--spec-min-p` sure). `STRATA_SWARM_SPEC=1` decides for all slots at
+once, the way DeepInfer schedules DSpark's drafts (`csrc/engine/mtp_varlen.hpp`, `MTPVarlen::schedule`; the idea, no
+code): each proposal's chance to be committed (the product of the measured acceptance of the draft probabilities so far,
+the same calibration as `STRATA_SPEC_COST`), every slot's proposals sorted by it, and the set with the most expected
+tokens per millisecond taken, a round costing the larger of the busiest stage's load (every group's window on it) and
+the slowest group's trip through the stages (plus its drafter chain when a group had to wait for it). The window times per
+stage and row count are measured as the groups run (`spec/swarm_schedule.hpp`). A slot may verify none of its proposals
+(only its own token), and a slot whose rows are free - its group lighter than the one that sets the pace - may verify all N.
+`STRATA_SWARM_SPEC=2` also stops each slot's next drafter chain one step past the proposals it verified, so the drafter on
+the last stage's card does less. Give the schedule room with `STRATA_PIPED_MTP=3` (a group of one slot; 2 for two slots).
+
+Exact by construction: only which proposals are verified changes, and every verified row is judged as before, so every
+slot gets its solo tokens (greedy and seeded sampled rows: Philox(seed, position)). Unset or 0: the rule above, the code
+as before. One line per busy span (`strata batch STRATA_SWARM_SPEC=...`) gives the proposals per slot window, the share
+with none, the calibration and the cost table. Not measured on any GPU yet; a schedule tuned on wrong costs can be slower
+than the fixed rule. Checks: `swarm_schedule_test` (CPU), `tools/batch_test.py` as above with the variable set.
+
 ## Windows of 16 rows, and the four-card AMD profile
 
 A verify or batch window held at most 8 rows. On a layer split every group of the pipeline is its own window, so 32 slots ran as
