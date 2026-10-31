@@ -14204,6 +14204,13 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_KEEP_LOAN_MS");
             return v != nullptr ? (int64_t) std::max(0LL, std::atoll(v)) : (int64_t) 0;
         }();
+        // STRATA_KEEP_LOAN_MAX=T (default 4096): only a loan sized for chunks of at most T tokens is kept (~600 slots a stage
+        // here); a long prompt's loan (8192: ~900 slots, 16-19% of a stage's cache) is refilled at once, as before, so the
+        // windows between admissions never run that many experts on the CPU
+        static const int64_t keep_loan_max = [] {
+            const char* v = std::getenv("STRATA_KEEP_LOAN_MAX");
+            return v != nullptr ? (int64_t) std::max(0LL, std::atoll(v)) : (int64_t) 4096;
+        }();
         Clock::time_point loan_kept_at{};
         int64_t loan_n_kept = 0, loan_n_reused = 0, loan_n_back_idle = 0, loan_n_back_cmd = 0;
         double loan_back_ms = 0.0;
@@ -14211,6 +14218,11 @@ int main(int argc, char** argv) {
             for (const PfPart& p : pf_parts)
                 if (!p.lent.empty()) return true;
             return false;
+        };
+        auto loan_small = [&]() -> bool {   // every participant's loan is for chunks of at most STRATA_KEEP_LOAN_MAX tokens
+            for (const PfPart& p : pf_parts)
+                if (!p.lent.empty() && p.lent_chunk > keep_loan_max) return false;
+            return true;
         };
         auto loan_give_back = [&](const char* why, bool idle) -> bool {
             if (!loan_kept) return true;
@@ -16869,7 +16881,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
-            if (keep_loan && !cancelled && loan_out()) {   // STRATA_KEEP_LOAN_MS: the loan stays out for the next admission
+            if (keep_loan && !cancelled && loan_out() && loan_small()) {   // STRATA_KEEP_LOAN_MS: the loan stays out for the next admission
                 loan_kept = true;
                 loan_kept_at = Clock::now();
                 ++loan_n_kept;
