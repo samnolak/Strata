@@ -1306,6 +1306,13 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// MMQ reads whole column tiles of row ids (up to 128 each) without checking them against the group's last row: the
+// product past the chunk's last row when the last group's tile is not full, its stream-k fixup up to about two tiles -
+// so every id table MMQ reads carries readable entries after its last row (project-maya 87e088d, its issue #645:
+// compute-sanitizer flagged mul_mat_q reading up to 80 ids and the fixup ~190 past the table's end, which a card where
+// the next page is not mapped turns into "an illegal memory access").  The values there are never used: the tile's
+// writes stop at the group's last row.  Alloc::take's own slack (256-511 bytes) is less than the fixup reads.
+constexpr size_t MMQ_IDS_PAD = 512;
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
@@ -1835,7 +1842,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
-        m.ids_identity = o.take<int32_t>(T * K, ok);
+        m.ids_identity = o.take<int32_t>(T * K + MMQ_IDS_PAD, ok);
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
@@ -2230,7 +2237,8 @@ bool Prefill::bind_stage_helper(int64_t T) {
             return false;
     }
     const core::OnDevice on(P.dev);
-    mmq::iota(P.ident, T * K, P.s);           // the helper's row table: a refill may have overwritten its slots
+    // the helper's row table (carve padded it: h.T >= T): a refill may have overwritten its slots
+    mmq::iota(P.ident, T * K + (int64_t) MMQ_IDS_PAD, P.s);
     return true;
 }
 
@@ -2352,14 +2360,14 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         pp->pair = (int32_t*) take((size_t) Rt * 4);
     }
     pp->src = (int32_t*) take((size_t) Rt * 4);
-    pp->ident = (int32_t*) take((size_t) Rt * 4);
+    pp->ident = (int32_t*) take(((size_t) Rt + MMQ_IDS_PAD) * 4);   // MMQ reads ids past the last row (MMQ_IDS_PAD)
     pp->bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
     pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
     pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL);
     if (ok) {
         pp->ctx = std::make_unique<mmq::Context>();
         pp->run_ctx = pp->ctx.get();
-        mmq::iota(pp->ident, pp->cap_rows, pp->s);
+        mmq::iota(pp->ident, pp->cap_rows + (int64_t) MMQ_IDS_PAD, pp->s);
         peer_had_signs(*pp);   // APR: on the peer's device
         ok = cudaStreamSynchronize(pp->s) == cudaSuccess;
     }
@@ -2575,7 +2583,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
-        o.take<int32_t>(T * K, ok);
+        o.take<int32_t>(T * K + MMQ_IDS_PAD, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
@@ -3040,7 +3048,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const cudaStream_t cs = (cudaStream_t) m.cs;
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
-    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K + (int64_t) MMQ_IDS_PAD, m.cs);
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
@@ -6239,7 +6247,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
     PfTimer pt;
     // the MMQ row table lives in the borrowed cache slots when the prompt path borrows: written for every prompt
     // (none without an MMQ layer: the FP16 path has no such table)
-    if (m.ids_identity) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    if (m.ids_identity) mmq::iota(m.ids_identity, m.T * K + (int64_t) MMQ_IDS_PAD, m.cs);
     // ---- the PLE rows, read per chunk on a thread as run_impl does (the same state machine, in chunk order)
     const bool ple_on = m.ss->ple.ready();
     static const bool ple_batch_env = [] {
