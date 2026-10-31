@@ -14369,8 +14369,11 @@ int main(int argc, char** argv) {
             }
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
-                Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
+                Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0)) {
+                // (STRATA_KEEP_LOAN_MS: the learned profile ranks by residency - the lent experts count as resident again)
+                if (loan_kept && !loan_give_back("profile save", false)) return 1;
                 save_profile("periodic");
+            }
             if (line == "QUIT") break;
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
