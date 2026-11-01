@@ -1,11 +1,13 @@
 // tests/program/stage_reserve_test.cpp - #3702: the later-stage reserve arithmetic of the layer split search.
 // reserve_mib / room_bytes must equal generate.cpp's `stage_room` expression as it was written there; the proposal
-// functions are pinned too (they are not used by the default placement).
+// functions are pinned too (they are not used by the default placement).  p55/final2-c: the per-device reserve
+// (--vram-reserve-per-dev / STRATA_VRAM_RESERVE_PER_DEV) - its parser, its lookup, and that an unset list changes nothing.
 #include "strata/program/stage_reserve.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 using namespace strata::program::stage_reserve;
 
@@ -94,6 +96,85 @@ int main() {
         check(proposed_reserve_mib(in, 6) == 700 + 174, "proposed reserve on a later card, six sizes");
         in.later = false;
         check(proposed_reserve_mib(in, 6) == reserve_mib(in), "the first card is not changed by the proposal");
+    }
+    // ---- p55/final2-c: the per-device reserve (--vram-reserve-per-dev / STRATA_VRAM_RESERVE_PER_DEV)
+    // not given (empty list): base_reserve_for is the old expression on every device, so stage_room's room is too
+    {
+        const std::vector<int64_t> none;
+        for (int dev = -1; dev < 6; ++dev)
+            for (int64_t vr : {int64_t(0), int64_t(700), int64_t(4608)})
+                for (int64_t vl : {int64_t(-1), int64_t(0), int64_t(1400)})
+                    for (int later = 0; later < 2; ++later)
+                        for (int64_t fb : {int64_t(0), int64_t(3000) << 20, int64_t(26) << 30}) {
+                            Inputs in;
+                            in.base_reserve_mib = base_reserve_for(dev < 0 ? 0 : dev, later != 0, vr, vl, none);
+                            in.later = later != 0;
+                            in.pipe_window_mib = 160;
+                            ++cases;
+                            check(in.base_reserve_mib == (later && vl >= 0 ? vl : vr), "unset list: the old base reserve");
+                            check(room_bytes(fb, in) == legacy_room(fb, vr, vl, 0, later != 0, false, 1),
+                                  "unset list: the room equals the old expression (dev " + std::to_string(dev) + ")");
+                        }
+    }
+    // parsing
+    {
+        std::vector<int64_t> v;
+        std::string e;
+        check(parse_per_dev("3584,2816,2816,6656", v, e) && v == std::vector<int64_t>{3584, 2816, 2816, 6656}, "parse: four items");
+        check(parse_per_dev(" 3072 , 2048,2048 ,4608 ", v, e) && v == std::vector<int64_t>{3072, 2048, 2048, 4608}, "parse: spaces");
+        check(parse_per_dev("-,2048,,6144", v, e) && v == std::vector<int64_t>{-1, 2048, -1, 6144}, "parse: - and empty keep a device");
+        check(parse_per_dev("0", v, e) && v == std::vector<int64_t>{0}, "parse: 0 is a reserve");
+        check(parse_per_dev("1048576", v, e) && v.size() == 1, "parse: the largest figure");
+        check(!parse_per_dev("1048577", v, e) && v.empty() && !e.empty(), "parse: above 1 TiB refused");
+        check(!parse_per_dev("", v, e) && v.empty(), "parse: empty refused");
+        check(!parse_per_dev(",,-", v, e) && v.empty(), "parse: nothing given refused");
+        check(!parse_per_dev("3072,-5,2048", v, e) && v.empty(), "parse: a negative figure refused");
+        check(!parse_per_dev("3072,2k", v, e) && v.empty(), "parse: a unit refused");
+        check(!parse_per_dev("3.5", v, e) && v.empty(), "parse: a fraction refused");
+        check(!parse_per_dev("99999999999999999999", v, e) && v.empty(), "parse: an overflowing figure refused");
+        check(!parse_per_dev("1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17", v, e) && v.empty(), "parse: 17 items refused");
+        check(parse_per_dev("1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16", v, e) && v.size() == 16, "parse: 16 items");
+    }
+    // lookup: the list's value wins on its device; a device without one (-1, past the end) keeps the old rule
+    {
+        const std::vector<int64_t> pd{3584, 2816, -1, 6656};
+        check(base_reserve_for(0, false, 4608, -1, pd) == 3584, "per-dev: CUDA0 its own");
+        check(base_reserve_for(1, true, 4608, -1, pd) == 2816, "per-dev: CUDA1 its own");
+        check(base_reserve_for(2, true, 4608, -1, pd) == 4608, "per-dev: CUDA2 not given -> --vram-reserve-mib");
+        check(base_reserve_for(2, true, 4608, 1800, pd) == 1800, "per-dev: CUDA2 not given -> --vram-reserve-later-mib");
+        check(base_reserve_for(3, true, 4608, 1800, pd) == 6656, "per-dev: the list beats --vram-reserve-later-mib");
+        check(base_reserve_for(4, true, 4608, -1, pd) == 4608, "per-dev: past the list -> the old rule");
+        check(base_reserve_for(-1, false, 4608, -1, pd) == 4608, "per-dev: a negative ordinal -> the old rule");
+        check(per_dev_value(pd, 2) == -1 && per_dev_value(pd, 9) == -1 && per_dev_value(pd, 3) == 6656, "per-dev: per_dev_value");
+        check(base_reserve_for(1, true, 4608, -1, std::vector<int64_t>{-1, 0}) == 0, "per-dev: 0 is a reserve, not 'unset'");
+    }
+    // the 4x RTX 4080 32 GB of this fork (display on CUDA3), K=11,24,37 at reserve 4608 measured: CUDA1 26.75 GiB free ->
+    // room 22.00 GiB (the 96 MiB windows + 160 MiB --pipeline-windows on top of the base).  With 2816 there the room grows by
+    // exactly 4608 - 2816 MiB, and with 6656 on CUDA3 it shrinks by 6656 - 4608: the per-device value moves the base and
+    // nothing else.
+    {
+        const std::vector<int64_t> pd{3584, 2816, 2816, 6656};
+        const int64_t fb1 = (int64_t) (26.75 * 1073741824.0);
+        Inputs a;
+        a.later = true;
+        a.pipe_window_mib = 160;
+        a.pipe_snap_mib = 96;
+        a.base_reserve_mib = base_reserve_for(1, true, 4608, -1, std::vector<int64_t>{});
+        Inputs b = a;
+        b.base_reserve_mib = base_reserve_for(1, true, 4608, -1, pd);
+        check(reserve_mib(a) == 4608 + 96 + 160, "4080 rig: CUDA1 keeps 4864 MiB at reserve 4608");
+        check(room_bytes(fb1, b) - room_bytes(fb1, a) == (int64_t) (4608 - 2816) << 20, "4080 rig: CUDA1 gains 1792 MiB");
+        Inputs c = a;
+        c.base_reserve_mib = base_reserve_for(3, true, 4608, -1, pd);
+        check(room_bytes(fb1, a) - room_bytes(fb1, c) == (int64_t) (6656 - 4608) << 20, "4080 rig: CUDA3 gives 2048 MiB");
+        Inputs d = a;
+        d.later = false;
+        d.base_reserve_mib = base_reserve_for(0, false, 4608, -1, pd);
+        check(reserve_mib(d) == 3584 + 96 + 160, "4080 rig: CUDA0 first stage: base + the second GDN state + the second verifier");
+        // a reserve larger than the free memory leaves no room, never a negative one
+        Inputs z = a;
+        z.base_reserve_mib = base_reserve_for(0, true, 0, -1, std::vector<int64_t>{40000});
+        check(room_bytes(fb1, z) == 0, "4080 rig: an oversized reserve -> room 0");
     }
     std::printf("stage_reserve_test: %ld cases, %s\n", cases, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace strata::program::stage_reserve {
 
@@ -19,7 +21,7 @@ constexpr int64_t kWindowMib = 96;       ///< the verify windows on a later stag
 constexpr int64_t kDrafterMib = 1000;    ///< the MTP drafter (839 MiB) + the head, on the last stage only
 
 struct Inputs {
-    int64_t base_reserve_mib = 0;   ///< --vram-reserve-later-mib on a later stage when given, else --vram-reserve-mib
+    int64_t base_reserve_mib = 0;   ///< base_reserve_for(): the per-device value when given, else --vram-reserve-later-mib on a later stage when given, else --vram-reserve-mib
     int64_t prompt_buffers_mib = 0; ///< the prompt path's own buffers (0 when they are borrowed from the cache)
     bool later = false;             ///< a stage after the first
     bool drafter = false;           ///< the stage that carries the MTP drafter and the head
@@ -38,6 +40,75 @@ inline int64_t reserve_mib(const Inputs& in) {
 /// The room the cache may use: the free bytes less the reserve, never below 0.
 inline int64_t room_bytes(int64_t free_bytes, const Inputs& in) {
     return std::max<int64_t>(free_bytes - (reserve_mib(in) << 20), 0);
+}
+
+// ---------------------------------------------------------------------------------------------------- per device
+// p55/final2-c (opt-in): one base reserve per CUDA device, `--vram-reserve-per-dev m0,m1,..` or
+// STRATA_VRAM_RESERVE_PER_DEV="m0,m1,..", indexed by the CUDA ordinal in the engine's order (CUDA_VISIBLE_DEVICES as the
+// server set it).  The two global flags can only give the first card one value and every later card another; a box
+// whose display sits on one of the later cards (here CUDA3) wants a large reserve there and small ones elsewhere.
+// An empty item or "-" keeps that device's reserve as before, and so does every device past the end of the list.
+// Not given (the list empty): base_reserve_for() is the old expression exactly (pinned by stage_reserve_test).
+
+constexpr size_t kPerDevMax = 16;              ///< items accepted in the list (CUDA ordinals 0..15)
+constexpr int64_t kPerDevMaxMib = 1 << 20;     ///< 1 TiB in MiB: a larger figure is a typo, not a reserve
+
+/// Parses "3584,2816,2816,6656" (spaces allowed around items; "" or "-" = not given -> -1).  At least one item must
+/// give a value.  On failure `err` says what is wrong and `out` is left empty.
+inline bool parse_per_dev(const std::string& s, std::vector<int64_t>& out, std::string& err) {
+    out.clear();
+    std::vector<int64_t> v;
+    bool any = false;
+    size_t a = 0;
+    while (true) {
+        size_t b = s.find(',', a);
+        if (b == std::string::npos) b = s.size();
+        std::string t = s.substr(a, b - a);
+        const size_t f = t.find_first_not_of(" \t");
+        t = f == std::string::npos ? std::string() : t.substr(f, t.find_last_not_of(" \t") - f + 1);
+        if (t.empty() || t == "-") {
+            v.push_back(-1);
+        } else {
+            if (t.find_first_not_of("0123456789") != std::string::npos || t.size() > 7) {
+                err = "item " + std::to_string(v.size()) + " (\"" + t + "\") is not a whole number of MiB";
+                return false;
+            }
+            const int64_t mib = std::stoll(t);
+            if (mib > kPerDevMaxMib) {
+                err = "item " + std::to_string(v.size()) + " (" + t + " MiB) is larger than " + std::to_string(kPerDevMaxMib);
+                return false;
+            }
+            v.push_back(mib);
+            any = true;
+        }
+        if (v.size() > kPerDevMax) {
+            err = "more than " + std::to_string(kPerDevMax) + " items";
+            return false;
+        }
+        if (b == s.size()) break;
+        a = b + 1;
+    }
+    if (!any) {
+        err = "no item gives a reserve (\"" + s + "\")";
+        return false;
+    }
+    out = std::move(v);
+    return true;
+}
+
+/// The value the list gives device `dev`, or -1 (not given, past the end, a negative ordinal).
+inline int64_t per_dev_value(const std::vector<int64_t>& per_dev, int dev) {
+    return dev >= 0 && (size_t) dev < per_dev.size() ? per_dev[(size_t) dev] : -1;
+}
+
+/// The base reserve (Inputs::base_reserve_mib) of device `dev` running a first (`later` false) or a later stage: the
+/// list's value for it when it gives one, else the old rule - a later stage --vram-reserve-later-mib when that was
+/// given (>= 0), else --vram-reserve-mib.
+inline int64_t base_reserve_for(int dev, bool later, int64_t vram_reserve_mib, int64_t vram_reserve_later_mib,
+                                const std::vector<int64_t>& per_dev) {
+    const int64_t mine = per_dev_value(per_dev, dev);
+    if (mine >= 0) return mine;
+    return later && vram_reserve_later_mib >= 0 ? vram_reserve_later_mib : vram_reserve_mib;
 }
 
 // ---------------------------------------------------------------------------------------------------- the proposal
