@@ -692,6 +692,13 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 }
 
 bool conversation_copy_stream_ready(int device) { return conversation_detail::copy_stream_ready(device); }
+bool conversation_copy_stream_prepare(int device) {
+    int cur = -1;
+    if (cudaGetDevice(&cur) != cudaSuccess || cur != device) { (void) cudaGetLastError(); return false; }
+    cudaStream_t s = nullptr;
+    if (conversation_detail::private_stream(s) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    return conversation_detail::copy_stream_ready(device);
+}
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {

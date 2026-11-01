@@ -708,6 +708,11 @@ the engine (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`, less 
 `--memory-limit-mib` cap. The startup line `strata generate: memory guard: limit X GiB (source: flag|cgroup|meminfo) ...` names
 the source. It covers parking and session files only, not the startup sizing of the arena, the resident budget or the Windows commit check.
 
+With `STRATA_STAGE_COPY_PARALLEL=1` (opt-in, PR #4002), a layer split's stages capture, restore and copy batch slots through
+persistent workers, one per stage, each on its own GPU and sessions; the copied bytes are the same. If `STRATA_PARK_ASYNC=1` or
+`STRATA_CKPT_ASYNC=1` is also set, the engine logs the conflict and keeps the stage copies serial (those modes share staging
+buffers between stages). See [BATCHING.md](BATCHING.md) for the copy switches.
+
 **When the arena does not fit in the RAM that is free (#4051).** The engine checks the RAM before it reads the experts into the
 arena. A memory limit below the arena (a container) stops the start with the numbers. Less free RAM than the arena (an engine
 that was still exiting, another program) is waited for up to 20 s, and the log says so (`STRATA_ARENA_RAM_WAIT_S` changes the
@@ -1065,6 +1070,20 @@ measured. "Exact" means the 10-prompt and 4K/20K identity gate with the switch o
 
 `STRATA_DEQUANT_WIDE` (wide dequantization of Q4_K, Q5_K, Q6_K and IQ4_XS for the prompt's dense weights) is on by default on
 sm_86 and sm_61, bit-exact. `STRATA_DEQUANT_WIDE=0` turns it off.
+
+`STRATA_SELECT_TWO_PASS=1` (opt-in; sm_80+, the prompt path's tensor-core block scorer): every block is scored once in
+single-pass TF32 with a per-block error bound, and again in the usual 3xTF32 only where the bound reaches the query's
+top-k cut-off (a query the bound cannot settle has its 16-query tile scored again in full), so the selected cells, their
+order and the ties are exactly the 3xTF32 scorer's (the bound and the rule: `include/strata/kernels/qsa_two_pass.hpp`).
+On an RTX 3090 (sm_86, PCIe 3.0, 250 W; the v0.2.6 release defaults, 2 pairs of 2 runs) a 256K prompt read 5.2% faster
+(1,887 to 1,984 tokens/s), a 128K prompt 2.2% faster and a 32K prompt the same within 1%; decode and the answers did not
+change. Calls whose last query has `STRATA_SELECT_TWO_PASS_MIN` blocks or more take it (default 4096, 16K cells).
+`STRATA_SELECT_TWO_PASS_CHECK=1` (a slow diagnostic) runs the 3xTF32 scorer beside it and prints, after each prompt, the
+queries whose ids differ (must be 0). Where the scorer cannot run (HIP, Metal and SYCL builds, a card below sm_80 or
+`STRATA_QSA_WARP`) a set switch prints one line saying it is not used there, and the selection is unchanged. The
+layer-major prompt path (the default on a CUDA layer split) takes it by the same rule (this fork; upstream PR #4119 had it
+in the chunked walk only); `STRATA_SELECT_TWO_PASS_LM=0` keeps that path on the 3xTF32 scorer. The check's own buffers
+are one set per card, so `STRATA_SELECT_TWO_PASS_CHECK=1` works on a layer split.
 
 ### RTX 20 (Turing, sm_75) kernels (opt-in)
 

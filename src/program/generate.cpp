@@ -42,6 +42,7 @@
 #include "strata/core/uma_cache.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/stage_pool.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
@@ -6404,6 +6405,64 @@ int main(int argc, char** argv) {
                          pm_drafts > 1 ? "s" : "");
         }
     }
+    const bool stage_copy_parallel = [] {
+        const char* v = std::getenv("STRATA_STAGE_COPY_PARALLEL");
+        if (v == nullptr || v[0] == '\0' || v[0] == '0') return false;
+        // The async checkpoint/park paths share staging buffers across devices.
+        // Keep their existing serial behavior when either is requested.
+        for (const char* name : {"STRATA_PARK_ASYNC", "STRATA_CKPT_ASYNC"}) {
+            const char* async = std::getenv(name);
+            if (async != nullptr && async[0] == '1') {
+                std::fprintf(stderr, "strata generate: STRATA_STAGE_COPY_PARALLEL is off: %s uses shared async staging; stage copies remain serial\n", name);
+                return false;
+            }
+        }
+        return true;
+    }();
+    std::unique_ptr<strata::core::StagePool> stage_pool;
+    // STRATA_STAGE_COPY_PARALLEL: worker k (k == 0: CUDA0, else stages[k - 1]) has its copy stream on that card (#2409)
+    std::vector<uint8_t> stage_pool_streams;
+    if (stage_copy_parallel && !stages.empty()) {
+        // The workers go where StageThreads' do (wide, then the aux CPUs): the host thread is pinned to one CPU once the
+        // CPU pool starts, and a thread it creates inherits that CPU, where the stages' host copies would take turns.
+        stage_pool = std::make_unique<strata::core::StagePool>(1 + stages.size(), [](size_t k) {
+            strata::platform::name_this_thread("strata-stcopy", (int) k);
+            StageThreads::spread_current_thread();
+        });
+        // #2409: a restore must not create a copy stream on a card the expert cache has filled (an out-of-memory there
+        // ends the process).  Worker k always copies on the same card (the bodies are in stage order), so it creates its
+        // stream now, before the cache takes the memory; the restore check below asks for the worker's stream.
+        stage_pool_streams.assign(1 + stages.size(), 0);
+        std::vector<std::function<bool(std::string&)>> warm(1 + stages.size());
+        for (size_t k = 0; k < warm.size(); ++k)
+            warm[k] = [&, k](std::string&) {
+                const int dev = k == 0 ? 0 : stages[k - 1]->dev;
+                const strata::core::OnDevice on(dev);
+                stage_pool_streams[k] = strata::core::conversation_copy_stream_prepare(dev) ? 1 : 0;
+                return true;
+            };
+        std::string warm_err;
+        (void) stage_pool->run(warm, warm_err);
+        size_t ready = 0;
+        for (const uint8_t r : stage_pool_streams) ready += r;
+        std::fprintf(stderr, "strata generate: STRATA_STAGE_COPY_PARALLEL=1: %zu stage copy workers (parks, parked restores, "
+                             "slot copies and checkpoint mounts copy every stage at once); %zu of %zu have their copy stream\n",
+                     warm.size(), ready, warm.size());
+    }
+    const bool stage_copy_trace = [] {
+        const char* v = std::getenv("STRATA_STAGE_COPY_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    auto stage_pool_run = [&](const std::vector<std::function<bool(std::string&)>>& bodies,
+                              std::string& error, const char* operation) {
+        std::vector<double> timings;
+        const bool ok = stage_pool->run(bodies, error, stage_copy_trace ? &timings : nullptr);
+        if (stage_copy_trace)
+            for (size_t k = 0; k < timings.size(); ++k)
+                std::fprintf(stderr, "strata stage copy: %s stage %zu in %.1f ms\n", operation, k, timings[k]);
+        return ok;
+    };
+
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
@@ -11164,41 +11223,67 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                // STRATA_CKPT_POOL: the running state and the checkpoint copies go into dropped checkpoints' vectors
-                // (the ones this request drops refill the pool right after); what is left goes back
-                std::vector<ConvCheckpoint> storage;
-                if (ckpt_pool.on() && n_st == 0)
-                    for (size_t k = 0; k <= view.checkpoints.size(); ++k) {
-                        ConvCheckpoint c = ckpt_pool.take();
-                        if (c.gdn.empty()) break;
-                        storage.push_back(std::move(c));
+                if (stage_pool) {
+                    // STRATA_STAGE_COPY_PARALLEL (PR #4002): every stage's image at once, each on its own worker and GPU.
+                    // (STRATA_CKPT_POOL's storage and STRATA_PARK_ASYNC's moved checkpoints are single-GPU only: n_st == 0)
+                    std::vector<strata::core::SavedConversation> parts(n_st);
+                    std::vector<size_t> stage_reused(n_st + 1, 0);
+                    std::vector<std::function<bool(std::string&)>> bodies(n_st + 1);
+                    bodies[0] = [&](std::string& e) {
+                        const strata::core::OnDevice on(0);
+                        return strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, e,
+                                std::move(reuse), &stage_reused[0]);
+                    };
+                    for (size_t k = 0; k < n_st; ++k)
+                        bodies[k + 1] = [&, k](std::string& e) {
+                            auto& st = stages[k];
+                            const strata::core::OnDevice on(st->dev);
+                            if (cudaDeviceSynchronize() != cudaSuccess) { e = "stage sync failed"; return false; }
+                            const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
+                            return strata::core::conversation_snapshot_save(parts[k], view_k, *src.stage_sessions[k], g,
+                                    draft_of(k), e, std::move(stage_reuse[k]), &stage_reused[k + 1]);
+                        };
+                    if (!stage_pool_run(bodies, err, "capture")) return false;
+                    pool_topup();   // (as the serial path does after its first save)
+                    for (size_t k = 0; k <= n_st; ++k) reused_bytes += stage_reused[k];
+                    for (auto& part : parts) image.stage_images.push_back(std::move(part));
+                } else {
+                    // STRATA_CKPT_POOL: the running state and the checkpoint copies go into dropped checkpoints' vectors
+                    // (the ones this request drops refill the pool right after); what is left goes back
+                    std::vector<ConvCheckpoint> storage;
+                    if (ckpt_pool.on() && n_st == 0)
+                        for (size_t k = 0; k <= view.checkpoints.size(); ++k) {
+                            ConvCheckpoint c = ckpt_pool.take();
+                            if (c.gdn.empty()) break;
+                            storage.push_back(std::move(c));
+                        }
+                    std::vector<ConvCheckpoint> moved;   // STRATA_PARK_ASYNC: the ones this request drops (view: the rest)
+                    if (park_drops && n_st == 0 && src.with_reuse) {   // (the main session's checkpoints only, not an idle slot's)
+                        size_t w = 0;
+                        for (size_t i = 0; i < checks.size(); ++i) {
+                            if (park_drops(static_cast<const ConvCheckpoint&>(checks[i]))) { moved.push_back(std::move(checks[i])); continue; }
+                            if (w != i) checks[w] = std::move(checks[i]);
+                            ++w;
+                        }
+                        checks.erase(checks.begin() + (std::ptrdiff_t) w, checks.end());
                     }
-                std::vector<ConvCheckpoint> moved;   // STRATA_PARK_ASYNC: the ones this request drops (view: the rest)
-                if (park_drops && n_st == 0 && src.with_reuse) {   // (the main session's checkpoints only, not an idle slot's)
-                    size_t w = 0;
-                    for (size_t i = 0; i < checks.size(); ++i) {
-                        if (park_drops(static_cast<const ConvCheckpoint&>(checks[i]))) { moved.push_back(std::move(checks[i])); continue; }
-                        if (w != i) checks[w] = std::move(checks[i]);
-                        ++w;
+                    const bool saved = strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
+                            std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
+                            moved.empty() ? nullptr : &moved);
+                    for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
+                    if (!saved) return false;
+                    pool_topup();   // what the park took (and what moved out) is allocated again, in the background
+                    for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                        const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
+                        strata::core::SavedConversation part;
+                        if (!strata::core::conversation_snapshot_save(part, view_k, *src.stage_sessions[k], g, draft_of(k), err,
+                                std::move(stage_reuse[k]), &reused_bytes))
+                            return false;
+                        image.stage_images.push_back(std::move(part));
                     }
-                    checks.erase(checks.begin() + (std::ptrdiff_t) w, checks.end());
-                }
-                const bool saved = strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
-                        std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
-                        moved.empty() ? nullptr : &moved);
-                for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
-                if (!saved) return false;
-                pool_topup();   // what the park took (and what moved out) is allocated again, in the background
-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
-                    auto& st = stages[k];
-                    const strata::core::OnDevice on(st->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
-                    strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, *src.stage_sessions[k], g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
-                        return false;
-                    image.stage_images.push_back(std::move(part));
                 }
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
@@ -13089,21 +13174,35 @@ int main(int argc, char** argv) {
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             // STRATA_SLOT_COPY_BATCHSYNC: every copy is only queued, and the sync_all below is the one wait per device
             const bool queued = slot_copy_batchsync_env();
-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+            auto stage_copy = [&](size_t k, std::string& se) -> bool {
                 strata::core::SessionState& main_ss = k == 0 ? ss : stages[k - 1]->ss;
                 strata::core::SessionState& slot_ss = *bslot_ss[k][(size_t) b];
                 strata::core::SessionState& from = into_slot ? main_ss : slot_ss;
                 strata::core::SessionState& to = into_slot ? slot_ss : main_ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, e, queued)) return failed();
+                if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, se, queued)) return false;
                 for (int64_t j = 0; j < from.qsa_alloc; ++j)
                     if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
-                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
-                        return failed();
+                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, se, queued))
+                        return false;
+                return true;
+            };
+            if (stage_pool) {
+                std::vector<std::function<bool(std::string&)>> bodies(bslot_ss.size());
+                for (size_t k = 0; k < bodies.size(); ++k)
+                    bodies[k] = [&, k](std::string& se) { return stage_copy(k, se); };
+                if (!stage_pool_run(bodies, e, "slot_direct")) return failed();
+            } else {
+                for (size_t k = 0; k < bslot_ss.size(); ++k)
+                    if (!stage_copy(k, e)) return failed();
             }
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
+        static const bool slot_shuttle_reuse = [] {
+            const char* v = std::getenv("STRATA_SLOT_SHUTTLE_REUSE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
 #if defined(STRATA_GPU_METAL)
@@ -13112,26 +13211,39 @@ int main(int argc, char** argv) {
 #endif
             if (slot_copy_direct) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
-            } else
-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
-                strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
-                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
-                strata::core::ConversationCheckpoint ck;
-                ck.ids = ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                    !strata::core::conversation_checkpoint_restore(ck, to, g, e))
-                    return false;
-                for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                    strata::core::ConversationKv img;
-                    if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
+            } else {
+                auto stage_copy = [&](size_t k, std::string& se) -> bool {
+                    strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
+                    strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
+                    const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                    if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
+                    strata::core::ConversationCheckpoint ck;
+                    ck.ids = ids;
+                    if (!strata::core::conversation_checkpoint_save(ck, from, g, se) ||
+                        !strata::core::conversation_checkpoint_restore(ck, to, g, se))
                         return false;
-                    if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
-                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
-                        return false;
+                    strata::core::ConversationKv shuttle;
+                    for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                        strata::core::ConversationKv fresh;
+                        strata::core::ConversationKv& img = slot_shuttle_reuse ? shuttle : fresh;
+                        if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, se))
+                            return false;
+                        if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
+                        if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, se))
+                            return false;
+                    }
+                    if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
+                    return true;
+                };
+                if (stage_pool) {
+                    std::vector<std::function<bool(std::string&)>> bodies(bslot_ss.size());
+                    for (size_t k = 0; k < bodies.size(); ++k)
+                        bodies[k] = [&, k](std::string& se) { return stage_copy(k, se); };
+                    if (!stage_pool_run(bodies, e, "slot_to")) return false;
+                } else {
+                    for (size_t k = 0; k < bslot_ss.size(); ++k)
+                        if (!stage_copy(k, e)) return false;
                 }
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
             if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
@@ -13231,31 +13343,44 @@ int main(int argc, char** argv) {
 #endif
             if (slot_copy_direct && at == nullptr) {
                 if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
-            } else
-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
-                strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
-                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
-                if (at != nullptr) {
-                    if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
-                        return false;
+            } else {
+                auto stage_copy = [&](size_t k, std::string& se) -> bool {
+                    strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
+                    strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
+                    const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                    if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
+                    if (at != nullptr) {
+                        if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, se))
+                            return false;
+                    } else {
+                        strata::core::ConversationCheckpoint ck;
+                        ck.ids = bs[(size_t) b].ids;
+                        if (!strata::core::conversation_checkpoint_save(ck, from, g, se) ||
+                            !strata::core::conversation_checkpoint_restore(ck, to, g, se))
+                            return false;
+                    }
+                    strata::core::ConversationKv shuttle;
+                    for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                        strata::core::ConversationKv fresh;
+                        strata::core::ConversationKv& img = slot_shuttle_reuse ? shuttle : fresh;
+                        if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, se))
+                            return false;
+                        if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
+                        if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, se))
+                            return false;
+                    }
+                    if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
+                    return true;
+                };
+                if (stage_pool) {
+                    std::vector<std::function<bool(std::string&)>> bodies(bslot_ss.size());
+                    for (size_t k = 0; k < bodies.size(); ++k)
+                        bodies[k] = [&, k](std::string& se) { return stage_copy(k, se); };
+                    if (!stage_pool_run(bodies, e, "slot_from")) return false;
                 } else {
-                    strata::core::ConversationCheckpoint ck;
-                    ck.ids = bs[(size_t) b].ids;
-                    if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                        !strata::core::conversation_checkpoint_restore(ck, to, g, e))
-                        return false;
+                    for (size_t k = 0; k < bslot_ss.size(); ++k)
+                        if (!stage_copy(k, e)) return false;
                 }
-                for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                    strata::core::ConversationKv img;
-                    if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
-                        return false;
-                    if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
-                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
-                        return false;
-                }
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
             if (batch_mtp) {
                 // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
@@ -15351,7 +15476,11 @@ int main(int argc, char** argv) {
                         break;
                     }
                     restore_free.push_back((uint64_t) fb);
-                    restore_ready.push_back(strata::core::conversation_copy_stream_ready(cur) ? 1 : 0);
+                    // STRATA_STAGE_COPY_PARALLEL: the restore runs on stage worker k, whose stream was made at start-up
+                    const size_t wk = restore_ready.size();
+                    const bool stream_ready = stage_pool ? wk < stage_pool_streams.size() && stage_pool_streams[wk] != 0
+                                                         : strata::core::conversation_copy_stream_ready(cur);
+                    restore_ready.push_back(stream_ready ? 1 : 0);
                 }
                 if (sampled &&
                     !strata::program::conv_cache::restore_fits(restore_free.data(), restore_ready.data(), restore_free.size(),
@@ -15625,24 +15754,48 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
-                    strata::core::ConversationRestore::restored) {
-                    // Already prevalidated above: a failure here is fatal, never
-                    // permission to decode from a partially restored session.
-                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
-                    return 1;
-                }
-                for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
-                    const strata::core::OnDevice on(stages[i]->dev);
-                    if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
-                        strata::core::ConversationRestore::restored) {
-                        std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
-                                    err.c_str());
+                if (stage_pool) {
+                    std::vector<std::function<bool(std::string&)>> bodies(1 + stages.size());
+                    bodies[0] = [&](std::string& e) {
+                        const strata::core::OnDevice on(0);
+                        return strata::core::conversation_snapshot_restore(*incoming, ss, g,
+                                use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, e) ==
+                            strata::core::ConversationRestore::restored;
+                    };
+                    for (size_t i = 0; i < stages.size(); ++i)
+                        bodies[i + 1] = [&, i](std::string& e) {
+                            const strata::core::OnDevice on(stages[i]->dev);
+                            if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
+                                    use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, e) !=
+                                strata::core::ConversationRestore::restored)
+                                return false;
+                            if (cudaDeviceSynchronize() != cudaSuccess) { e = "stage sync failed"; return false; }
+                            return true;
+                        };
+                    if (!stage_pool_run(bodies, err, "parked_restore")) {
+                        std::printf("ERR restoring parked conversation: %s\n", err.c_str());
                         return 1;
                     }
-                    if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
+                } else {
+                    if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
+                            use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
+                        strata::core::ConversationRestore::restored) {
+                        // Already prevalidated above: a failure here is fatal, never
+                        // permission to decode from a partially restored session.
+                        std::printf("ERR restoring parked conversation: %s\n", err.c_str());
+                        return 1;
+                    }
+                    for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
+                        const strata::core::OnDevice on(stages[i]->dev);
+                        if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
+                                use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            strata::core::ConversationRestore::restored) {
+                            std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
+                                        err.c_str());
+                            return 1;
+                        }
+                        if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
+                    }
                 }
                 if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;
@@ -15753,8 +15906,29 @@ int main(int argc, char** argv) {
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
-                           [&] {
+                } else if (c == nullptr ||
+                           [&] {   // true: the mount failed
+                               if (stage_pool && c->stage_parts.size() == stages.size()) {
+                                   // STRATA_STAGE_COPY_PARALLEL: every stage's running state at once, each on its own
+                                   // worker and card (the same copies as below)
+                                   std::vector<std::function<bool(std::string&)>> bodies(1 + stages.size());
+                                   bodies[0] = [&](std::string& e) {
+                                       const strata::core::OnDevice on(0);
+                                       if (checkpoint_restore(*c, ss, g)) return true;
+                                       e = "CUDA0";
+                                       return false;
+                                   };
+                                   for (size_t i = 0; i < stages.size(); ++i)
+                                       bodies[i + 1] = [&, i](std::string& e) {
+                                           const strata::core::OnDevice on(stages[i]->dev);
+                                           if (checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
+                                           e = "stage CUDA" + std::to_string(stages[i]->dev);
+                                           return false;
+                                       };
+                                   std::string e;
+                                   return !stage_pool_run(bodies, e, "checkpoint_mount");
+                               }
+                               if (!checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size()) return true;
                                for (size_t i = 0; i < stages.size(); ++i) {
                                    const strata::core::OnDevice on(stages[i]->dev);
                                    if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
