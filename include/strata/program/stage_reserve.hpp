@@ -118,7 +118,8 @@ inline int64_t base_reserve_for(int dev, bool later, int64_t vram_reserve_mib, i
 
 /// The start-up step: the primary card's item when the list gives one.  `vram_reserve_mib` / `given` are updated in place
 /// and the flag's value before the override is returned (the fallback for later devices), or -1 when nothing was
-/// overridden (then `vram_reserve_mib` still is the flag's value, also after the auto paths adapt it).
+/// overridden (then `vram_reserve_mib` still is the flag's value, also after the auto paths adapt it).  -1 can mean "not
+/// overridden" only because the reserve itself is never negative: generate.cpp refuses --vram-reserve-mib < 0 (exit 2).
 inline int64_t apply_primary(const std::vector<int64_t>& per_dev, int primary_device, int& vram_reserve_mib, bool& given) {
     const int64_t first = per_dev_value(per_dev, primary_device);
     if (first < 0) return -1;
