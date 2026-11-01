@@ -1269,6 +1269,13 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
     // because its gather buffers carry a zeroed tail; a dense tensor is passed as-is, so a K that
     // is not a full chunk multiple (e.g. the 640-value shared-expert down: 20 blocks of 32) stays on
     // the dequantize + cuBLAS path (dense_mmq::shape_ok).
+    // F6: on CUDA only the Q8_0 projections (dense_mmq::type_ok); HIP keeps every type mmq::fits() takes
+#if defined(STRATA_USE_HIP)
+    constexpr bool kHip = true;
+#else
+    constexpr bool kHip = false;
+#endif
+    if (!dm::type_ok(type, kHip)) return false;
     if (!dm::shape_ok(N, K) || !mmq::built() || !mmq::fits(type, N)) return false;
     const int64_t R = dm::rows_per_pass(scratch_elems_, K, T);   // FP32 activations for a chunk fit in the FP16 dequant scratch
     if (R < 1) return false;
@@ -1285,9 +1292,9 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
         }
         mmq_ctx_ = new mmq::Context();
         mmq::iota((int32_t*) ((uint8_t*) mmq_buf_ + ident_off), kRows, stream_);
-        std::fprintf(stderr, "prefill gemm: dense MMQ on (STRATA_DENSE_MMQ=1): the dense GGUF projections with K a multiple of "
+        std::fprintf(stderr, "prefill gemm: dense MMQ on (STRATA_DENSE_MMQ=1): the dense %sGGUF projections with K a multiple of "
                              "256 run as int8 MMQ, activations rounded to q8_1 (not the FP16 path's bits)%s\n",
-                     min_t > 0 ? ", from STRATA_DENSE_MMQ_MIN_T rows" : "");
+                     kHip ? "" : "Q8_0 ", min_t > 0 ? ", from STRATA_DENSE_MMQ_MIN_T rows" : "");
     }
     void* xq = mmq_buf_;
     const int32_t* ident = (const int32_t*) ((uint8_t*) mmq_buf_ + ident_off);

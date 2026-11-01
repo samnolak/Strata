@@ -47,6 +47,15 @@ constexpr int64_t rows_per_pass(int64_t scratch_elems, int64_t K, int64_t T) {
     return r < 1 ? 0 : r;
 }
 
+/// GGML_TYPE_Q8_0 (the stable GGML type id, as native_mmvq.hpp lists them: no ggml dependency here).
+constexpr int kTypeQ8_0 = 8;
+
+/// The weight type test (review F6): on CUDA only Q8_0 - the dense projections of the UD-Q*_K_XL packs, the type E22
+/// sized and the docs name; any other type mmq::fits() would take (a K-quant dense tensor of another pack) stays on the
+/// dequantize + cuBLAS path, untested there.  On HIP every type mmq::fits() takes, as before (the mixed-quant packs'
+/// K-quants).  mmq::fits() stays the caller's other test.
+constexpr bool type_ok(int ggml_type, bool hip) { return hip || ggml_type == kTypeQ8_0; }
+
 /// The number of MMQ passes a product of T rows takes (0 when rows_per_pass is 0).
 constexpr int64_t passes(int64_t scratch_elems, int64_t K, int64_t T) {
     const int64_t r = rows_per_pass(scratch_elems, K, T);

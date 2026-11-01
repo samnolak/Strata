@@ -1,5 +1,6 @@
 // STRATA_DENSE_MMQ's rules (include/strata/prefill/dense_mmq_rules.hpp): no GPU, no model.
 #include <cstdio>
+#include <initializer_list>
 
 #include "strata/prefill/dense_mmq_rules.hpp"
 
@@ -63,6 +64,15 @@ int main() {
     CHECK(dm::passes(1ll << 26, 2560, 27240) == 27);               // a subagent's first read (layer-major super-chunk)
     CHECK(dm::passes(2 * 6144 * 300, 6144, 1254) == 5);
     CHECK(dm::passes(0, 2560, 1254) == 0);
+    // F6: the weight type - CUDA takes Q8_0 only, HIP every type (mmq::fits decides there)
+    CHECK(dm::kTypeQ8_0 == 8);                 // GGML_TYPE_Q8_0
+    CHECK(dm::type_ok(8, false));              // Q8_0 on CUDA
+    for (int t : {0, 1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 20, 23, 30, 39, 42}) {   // F32, F16, Q4_0, Q5_0, K-quants, IQ4_*, BF16, ...
+        CHECK(!dm::type_ok(t, false));
+        CHECK(dm::type_ok(t, true));
+    }
+    CHECK(dm::type_ok(8, true));
+    static_assert(dm::type_ok(dm::kTypeQ8_0, false) && !dm::type_ok(14, false) && dm::type_ok(14, true), "constexpr");
     static_assert(dm::shape_ok(10240, 2560) && !dm::shape_ok(2560, 640), "constexpr");
     static_assert(dm::rows_per_pass(1ll << 26, 2560, 1254) == 1024, "constexpr");
 
