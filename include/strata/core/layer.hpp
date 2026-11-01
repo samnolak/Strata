@@ -296,7 +296,8 @@ void qsa_rope_share_register(const QsaState& owner, int64_t n_rot);
 /// largest pinned allocation of a long-context --batch run: 9,792 B per cell and session at k8v4) gets addresses for
 /// the whole context at start but pinned RAM only for the cells reached, 16384 at first (STRATA_KV_HOST_LAZY_INIT)
 /// and then in steps of 16384 (STRATA_KV_HOST_LAZY_STEP).  The bytes and their addresses are the ones the whole
-/// copy has, so outputs are the same.  Unset: the whole copy pinned at start, exactly as before.
+/// copy has, so outputs are the same.  A growth that would leave less than STRATA_KV_HOST_LAZY_FLOOR_MIB (6144) of
+/// MemAvailable is refused and fails that request with the reason.  Unset: the whole copy pinned at start, as before.
 bool qsa_kv_host_lazy();
 /// Pins `st`'s host copy for cells [0, cells) if it is lazy and not pinned that far (whole steps, at most max_cells).
 /// Every writer of a host copy calls it first (session_kv_ensure: the prompt path, the verify windows, the copies

@@ -848,11 +848,40 @@ uint64_t page_bytes() {
     return v;
 }
 uint8_t* align_ptr_up(uint8_t* p, uint64_t a) { return (uint8_t*) (((uintptr_t) p + a - 1) / a * a); }
+// MemAvailable, bytes (0 when it cannot be read: no floor check then)
+uint64_t mem_available_bytes() {
+    std::FILE* f = std::fopen("/proc/meminfo", "r");
+    if (f == nullptr) return 0;
+    char line[256];
+    unsigned long long kb = 0;
+    while (std::fgets(line, sizeof line, f) != nullptr)
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+    std::fclose(f);
+    return (uint64_t) kb * 1024ull;
+}
+// Pinned RAM cannot be swapped or reclaimed: a growth that would leave less than this available is refused (the request
+// fails with the reason) instead of pushing the PC into the OOM killer.  STRATA_KV_HOST_LAZY_FLOOR_MIB, default 6144.
+uint64_t lazy_floor_bytes() {
+    static const uint64_t v = (uint64_t) lazy_env("STRATA_KV_HOST_LAZY_FLOOR_MIB", 6144) << 20;
+    return v;
+}
 // Registers every array up to `to_cells` (<= max_cells).  Under g_lazy_mu.  false: a registration was refused
 // (the arrays that did grow keep it; h.cells stays the common minimum).
 bool lazy_grow(LazyHost& h, int64_t to_cells, std::string& why) {
     to_cells = std::min(to_cells, h.max_cells);
     if (to_cells <= h.cells) return true;
+    uint64_t need = 0;
+    for (size_t r = 0; r < h.run.size(); ++r) {
+        uint8_t* want = h.run[r] + (uint64_t) to_cells * (uint64_t) h.rows_per_cell * h.row_bytes[r];
+        uint8_t* end = std::min(align_ptr_up(want, page_bytes()), h.run_end[r]);
+        if (end > h.reg_end[r]) need += (uint64_t) (end - h.reg_end[r]);
+    }
+    if (const uint64_t avail = mem_available_bytes(); avail > 0 && avail < need + lazy_floor_bytes()) {
+        why = "pinning " + std::to_string(need >> 20) + " MiB more would leave less than the " +
+              std::to_string(lazy_floor_bytes() >> 20) + " MiB floor of available RAM (" + std::to_string(avail >> 20) +
+              " MiB available; STRATA_KV_HOST_LAZY_FLOOR_MIB)";
+        return false;
+    }
     uint64_t added = 0;
     for (size_t r = 0; r < h.run.size(); ++r) {
         uint8_t* want = h.run[r] + (uint64_t) to_cells * (uint64_t) h.rows_per_cell * h.row_bytes[r];
