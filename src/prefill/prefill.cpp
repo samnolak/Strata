@@ -8,6 +8,7 @@
 #endif
 #include "strata/prefill/warm_policy.hpp"
 #include "strata/prefill/share_rules.hpp"
+#include "strata/prefill/lm_plan.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
@@ -6532,7 +6533,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     if (m.fused_bufs) { why = "the fused expert layout"; return 0; }
     if (!m.GU || !m.Dm || (n_mmq > 0 && !m.ids_identity)) { why = "the MoE buffers are missing"; return 0; }
     // (an explicit STRATA_PREFILL_LM_TOKENS may be one chunk: the A/B against the default path, experts aside)
-    const int64_t min_s = (lm_force_ || lm_force_env()) ? 1 : (lm_tokens_env() > 0 ? m.T : 2 * m.T);   // (lm_force_: run_multi - several prompts, however short)
+    const int64_t min_s = (lm_force_ || lm_pin_on_ || lm_force_env()) ? 1 : (lm_tokens_env() > 0 ? m.T : 2 * m.T);   // (lm_force_: run_multi - several prompts, however short; lm_pin_on_: a pinned super-chunk)
     if (n < min_s) { why = "a short prompt"; return 0; }
     const int64_t want = lm_tokens_env() > 0 ? lm_tokens_env() : (lm_by_default_ ? kLmDefaultOnTokens : kLmDefaultTokens);
     int64_t S = std::max<int64_t>(min_s, want / m.T * m.T);
@@ -6636,6 +6637,26 @@ int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
         p->hand_ev_ = nullptr;
         p->hand_pieces_ = 0;
     }
+    // STRATA_BRANCH_CHECKPOINT_ALIGN (pin_super_chunk): every stage at the pinned size - min(pin, n on the chunk grid),
+    // no even split, even under two chunks - so a run that starts on the grid of a longer read reads exactly that read's
+    // super-chunks; a stage that cannot take it declines the walk (the run is read chunk-major and the caller sees it)
+    if (lm_pin_ > 0) {
+        const int64_t T = impl_->T;
+        const int64_t s_want = std::min<int64_t>(lm_pin_, (n + T - 1) / T * T);
+        for (Prefill* p = this; p != nullptr; p = p->next_) {
+            if (p->impl_->lm.S > 0) p->lm_release();
+            p->lm_pin_on_ = true;
+            const int64_t s = p->lm_prepare(n, why, lm_pin_);
+            p->lm_pin_on_ = false;
+            if (s != s_want) {
+                if (s > 0) why = "the pinned super-chunk (" + std::to_string(s_want) + " tokens) does not fit, " + std::to_string(s) + " does";
+                if (p != this) why = "layers " + std::to_string(p->stage_lb_) + ".." + std::to_string(p->stage_le_) + ": " + why;
+                lm_release_chain();
+                return 0;
+            }
+        }
+        return s_want;
+    }
     int64_t cap = 0;
     for (int round = 0; round < 4; ++round) {
         bool same = true;
@@ -6681,6 +6702,61 @@ int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
 void Prefill::lm_release_chain() {
     for (Prefill* p = this; p != nullptr; p = p->next_)
         if (p->impl_) p->lm_release();
+}
+
+int64_t Prefill::lm_plan_super_chunk(int64_t n, int64_t chunk) const {
+#if defined(STRATA_GPU_METAL)
+    (void) n;
+    (void) chunk;
+    return 0;
+#else
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    constexpr bool lm_hip = true;
+#else
+    constexpr bool lm_hip = false;
+#endif
+    // run()'s gate, then lm_prepare / lm_prepare_chain's sizes without the VRAM fit (lm_plan.hpp)
+    if (hand_in_ != nullptr || !impl_ || impl_->T <= 0 ||
+        !strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026()))
+        return 0;
+    static_assert(kLmDefaultTokens == kLmPlanDefaultTokens && kLmDefaultOnTokens == kLmPlanDefaultOnTokens,
+                  "lm_plan.hpp mirrors the walk's targets");
+    LmKnobs k;
+    k.tokens = lm_tokens_env();
+    k.force = lm_force_env();
+    k.explicit_on = lm_env_explicit();
+    k.even = lm_even_env();
+    return lm_plan_grid(n, chunk > 0 ? chunk : impl_->T, k);
+#endif
+}
+
+int64_t Prefill::lm_probe(int64_t n, int64_t pin, std::string& why) {
+    why.clear();
+#if defined(STRATA_GPU_METAL)
+    (void) n;
+    (void) pin;
+    why = "Metal";
+    return 0;
+#else
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    constexpr bool lm_hip = true;
+#else
+    constexpr bool lm_hip = false;
+#endif
+    if (hand_in_ != nullptr || !impl_ ||
+        !strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026())) {
+        why = "the walk is off";
+        return 0;
+    }
+    const bool by_default = !lm_env_explicit();   // as run() sets it
+    for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
+    const int64_t pin0 = lm_pin_;
+    lm_pin_ = pin;
+    const int64_t s = lm_prepare_chain(n, why);
+    lm_pin_ = pin0;
+    lm_release_chain();
+    return s;
+#endif
 }
 
 bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
@@ -7876,6 +7952,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 #endif
     // layer-major prefill: STRATA_PREFILL_LAYER_MAJOR=1 / 0 win; unset, it is on for a CUDA layer split (sm120_series.hpp
     // prefill_layer_major_default; STRATA_DEFAULTS=026 and a HIP build leave it off)
+    lm_last_s_ = 0;
     if (hand_in_ == nullptr && impl_ &&
         strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026())) {
         const bool by_default = !lm_env_explicit();
@@ -7890,7 +7967,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                      "turns it off)\n", (long long) kLmDefaultOnTokens);
             }
         }
-        if (lm_prepare_chain(n, why) > 0) {
+        const int64_t s_lm = lm_prepare_chain(n, why);
+        if (s_lm > 0) {
+            lm_last_s_ = s_lm;
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
             // STRATA_SELECT_TWO_PASS runs in this walk too, unless STRATA_SELECT_TWO_PASS_LM=0 keeps it out: say so once
             static strata::kernels::two_pass::RequestStatus tp_status(std::getenv("STRATA_SELECT_TWO_PASS"));

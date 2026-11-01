@@ -299,6 +299,30 @@ public:
         return p->lm_mid_;
     }
 
+    /// STRATA_BRANCH_CHECKPOINT_ALIGN: the super-chunk the layer-major walk would read an n-token run in, as
+    /// lm_prepare_chain sizes it when VRAM is no limit (lm_plan.hpp); 0 when the walk is off or would not take n tokens.
+    /// The walk's other conditions (pictures, KVA, a --prefill-pipe plan, ...) are not checked: last_super_chunk() tells
+    /// what a run did.
+    int64_t lm_plan_super_chunk(int64_t n, int64_t chunk = 0) const;
+    /// STRATA_BRANCH_CHECKPOINT_ALIGN: the super-chunk run() would read an n-token run in NOW (the walk's gate, every
+    /// stage's lm_prepare with this VRAM, the even split; with `pin` > 0 the pinned size), its buffers released again;
+    /// 0 when the walk would not take it (`why`).  Called after lend(), so the buffers' chunk is the run's.
+    int64_t lm_probe(int64_t n, int64_t pin, std::string& why);
+    /// pin_super_chunk for a scope (reset on every way out)
+    struct PinScope {
+        Prefill& p;
+        PinScope(Prefill& q, int64_t s) : p(q) { p.pin_super_chunk(s); }
+        ~PinScope() { p.pin_super_chunk(0); }
+        PinScope(const PinScope&) = delete;
+        PinScope& operator=(const PinScope&) = delete;
+    };
+    /// The next runs' super-chunk, on the chain's first stage (0: off, as before): every stage's walk takes min(s, the run
+    /// rounded up to whole chunks) - even for a run under two chunks, and without the even split.  A run that cannot take
+    /// it (VRAM, another condition of the walk) is read chunk-major as before; last_super_chunk() then says 0.
+    void pin_super_chunk(int64_t s) { lm_pin_ = s; }
+    /// The super-chunk the last run() read in (0: not the layer-major walk).
+    int64_t last_super_chunk() const { return lm_last_s_; }
+
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
@@ -316,6 +340,9 @@ private:
     bool lm_mid_ = false;
     bool lm_force_ = false;        ///< run_multi: the walk even for a short total
     bool lm_by_default_ = false;   ///< the walk is on because nothing was set (a wider VRAM margin, the measured super-chunk size)
+    int64_t lm_pin_ = 0;           ///< pin_super_chunk (the first stage's)
+    bool lm_pin_on_ = false;       ///< lm_prepare_chain: this stage is being sized at the pinned super-chunk
+    int64_t lm_last_s_ = 0;        ///< last_super_chunk
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);

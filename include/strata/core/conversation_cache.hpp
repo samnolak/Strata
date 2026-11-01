@@ -36,6 +36,15 @@ struct ConversationCheckpoint {
     // STRATA_BRANCH_CHECKPOINT: taken where the prompt left a conversation the engine held - the point a client that
     // rewrites the end of its history continues from next, so a batch slot keeps its deepest one.  Run-time only.
     bool branch = false;
+    // STRATA_BRANCH_CHECKPOINT_ALIGN: a branch checkpoint taken on the super-chunk grid of its segment's read - where that
+    // read starts (`branch_anchor`; -1: not taken on a grid, or the read did not run as planned) and the grid it was
+    // taken on.  A read that goes on from it computes the bits of the read from the anchor only where it lies on the
+    // grid THAT read would cut (generate.cpp checks it per prompt).  Run-time only.
+    int64_t branch_anchor = -1, branch_grid = 0;
+    // STRATA_BRANCH_CHECKPOINT_ALIGN: a periodic mark (--prompt-cache-every / the near-tail one) or a branch checkpoint
+    // whose read did not run as planned - a cut no read makes, so an aligned read goes on from it only on the grid of
+    // `branch_anchor` (-1: never).  Run-time only.
+    bool mark = false;
     // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
     // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
     // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
@@ -307,6 +316,13 @@ public:
 
     template<class Token>
     Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+        return best(prompt, images, cvec, [](const ConversationCheckpoint&) { return true; });
+    }
+    /// best() over the checkpoints `usable` accepts (a parked conversation's live state always counts):
+    /// STRATA_BRANCH_CHECKPOINT_ALIGN leaves out a branch checkpoint that is off this prompt's grid.
+    template<class Token, class Usable>
+    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
+               const Usable& usable) const {
         Match best;
         // Ties prefer the most recently parked branch. The caller prefers its
         // already-active state when that offers the same prefix length.
@@ -318,7 +334,8 @@ public:
                 if (n > best.tokens) best = {i, n, live, serials_[i]};
             };
             consider(e.live, true);
-            for (const auto& c : e.checkpoints) consider(c, false);
+            for (const auto& c : e.checkpoints)
+                if (usable(c)) consider(c, false);
         }
         return best;
     }
