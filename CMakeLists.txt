@@ -420,6 +420,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)
   add_test(NAME share_rules_test COMMAND share_rules_test)
+  # STRATA_DENSE_MMQ's rules (dense_mmq_rules.hpp): which dense projections take MMQ and in how many row passes
+  add_executable(dense_mmq_rules_test tests/prefill/dense_mmq_rules_test.cpp)
+  target_include_directories(dense_mmq_rules_test PRIVATE include)
+  add_test(NAME dense_mmq_rules_test COMMAND dense_mmq_rules_test)
 
   # STRATA_SELECT_TWO_PASS: the bound between the single-pass and 3xTF32 QSA block scores and the cut-off rule that
   # keeps the selection (header-only, no GPU)
@@ -1348,15 +1352,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(tq_pascal_bench PRIVATE ${_strata_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
   target_link_libraries(tq_pascal_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME tq_pascal_bench COMMAND tq_pascal_bench)
-  set_tests_properties(iq_multi_parity PROPERTIES ENVIRONMENT "STRATA_KQ_SPLIT=1")   # the Q4_K / Q5_K / Q8_0 Split path against the old kernels
+  set_tests_properties(iq_multi_parity PROPERTIES ENVIRONMENT "STRATA_KQ_SPLIT=1;STRATA_Q6K_SPLIT=1")   # the Q4_K / Q5_K / Q8_0 and Q6_K Split paths against the old kernels
   # the same Split path on the other routes it can meet: the generic multi kernels (no V2K) and the fused gate/up + SwiGLU kernel, and the sub-16-row
   # gate/up route switched off (a K-quant row has 160 dots, not the 80 the sub-16 rows assume: STRATA_KQ_SPLIT=1 must stay bitwise on all of them)
   add_test(NAME iq_multi_parity_kq_nov2k COMMAND iq_multi_parity)
-  set_tests_properties(iq_multi_parity_kq_nov2k PROPERTIES ENVIRONMENT "STRATA_KQ_SPLIT=1;STRATA_EXPERT_V2K=0")
+  set_tests_properties(iq_multi_parity_kq_nov2k PROPERTIES ENVIRONMENT "STRATA_KQ_SPLIT=1;STRATA_Q6K_SPLIT=1;STRATA_EXPERT_V2K=0")
   add_test(NAME iq_multi_parity_kq_swiglu COMMAND iq_multi_parity)
-  set_tests_properties(iq_multi_parity_kq_swiglu PROPERTIES ENVIRONMENT "STRATA_KQ_SPLIT=1;STRATA_GU_SWIGLU=1")
+  set_tests_properties(iq_multi_parity_kq_swiglu PROPERTIES ENVIRONMENT "STRATA_KQ_SPLIT=1;STRATA_Q6K_SPLIT=1;STRATA_GU_SWIGLU=1")
   add_test(NAME iq_multi_parity_kq_nosub16 COMMAND iq_multi_parity)
-  set_tests_properties(iq_multi_parity_kq_nosub16 PROPERTIES ENVIRONMENT "STRATA_KQ_SPLIT=1;STRATA_NO_SUB16_GU=1")
+  set_tests_properties(iq_multi_parity_kq_nosub16 PROPERTIES ENVIRONMENT "STRATA_KQ_SPLIT=1;STRATA_Q6K_SPLIT=1;STRATA_NO_SUB16_GU=1")
   # the prompt path's DeltaNet recurrence: gdn_rec_kh_kernel against gdn_rec_cols_pipe_kernel, bitwise (GPU,
   # synthetic, no model; --bench adds timings).  NVIDIA only: cp.async and the CUDA occupancy API (not on gfx906)
   if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -2357,8 +2361,15 @@ if(STRATA_NATIVE_EXPERTS)
     if(_strata_mmq_tab_on)
       set(_strata_tab_cuh ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_mmq_tab.cuh)
       # the native packs' nine types, the ones prefill_mmq_tab_test checks bit for bit; the optional Q5_0 / K-quant
-      # instances (STRATA_ORCA_Q4KS_MMQ, STRATA_MMQ_KQUANTS) get no pointer table and keep the gather
+      # instances (STRATA_ORCA_Q4KS_MMQ, STRATA_MMQ_KQUANTS) get no pointer table and keep the gather - except Q6_K with
+      # STRATA_MMQ_KQUANTS (UD-Q6_K_XL: Q6_K gate/up + Q8_0 down, both then read in place; prefill_mmq_tab_test checks it
+      # against the gathered product of strata_kq, the same mmq.cuh templates built with the same flags).  Its instance
+      # lives here, not in strata_kq: run_tab is in this library (+~4 MiB of VRAM per GPU in a STRATA_MMQ_TAB build)
       set(_strata_mmq_tab_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+      if(STRATA_MMQ_KQUANTS)
+        list(APPEND _strata_mmq_tab_types q6_k)
+        target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TAB_Q6K=1)
+      endif()
       foreach(_t IN LISTS _strata_mmq_tab_types)
         string(TOUPPER ${_t} _strata_tab_T)
         configure_file(src/prefill/mmq_tab_instance.cu.in ${CMAKE_BINARY_DIR}/mmq_tab/mmq-tab-${_t}.cu @ONLY)
@@ -2476,7 +2487,8 @@ if(STRATA_NATIVE_EXPERTS)
       add_executable(prefill_mmq_tab_test tests/cuda/prefill_mmq_tab_test.cu)
       target_link_libraries(prefill_mmq_tab_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_mmq_tab_test COMMAND prefill_mmq_tab_test)
-      set_tests_properties(prefill_mmq_tab_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # STRATA_MMQ_KQ=1: the gathered Q6_K reference runs in strata_kq (next to the test), and Q6_K's table needs it on
+      set_tests_properties(prefill_mmq_tab_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 ENVIRONMENT STRATA_MMQ_KQ=1)
     endif()
     if(STRATA_BUILD_TESTS AND STRATA_MMQ_KQUANTS)
       # the UD-Q4_K_XL expert formats through MMQ against ggml's dequantized weights (synthetic, a few seconds)

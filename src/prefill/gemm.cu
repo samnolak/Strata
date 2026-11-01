@@ -1,8 +1,11 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+// STRATA_DENSE_MMQ: the dense GGUF projections through MMQ - HIP (the mixed-quant packs' K-quants) and, since E22, CUDA
+// (the Q8_0 projections of UD-Q*_K_XL; see dense_mmq_rules.hpp)
+#if defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/dense_mmq_rules.hpp"
 #endif
 
 #ifdef STRATA_USE_HIP
@@ -643,7 +646,7 @@ Gemm::~Gemm() {
     for (void* e : side_free_)
         if (e) (void) cudaEventDestroy((cudaEvent_t) e);
     if (side_stream_) (void) cudaStreamDestroy((cudaStream_t) side_stream_);
-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+#if defined(STRATA_PREFILL_MMQ)
     delete static_cast<strata::prefill::mmq::Context*>(mmq_ctx_);
     if (mmq_buf_) cudaFree(mmq_buf_);
 #endif
@@ -1248,26 +1251,33 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
 }
 
-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+#if defined(STRATA_PREFILL_MMQ)
 bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int64_t T, int64_t N, int64_t K,
                       int64_t ldy) {
     namespace mmq = strata::prefill::mmq;
-    constexpr int64_t kRows = 1024, kMaxK = 8192;
-    static const bool enabled = [] {
-        const char* e = std::getenv("STRATA_DENSE_MMQ");
-        return e && e[0] == '1';
-    }();
-    if (!enabled || mmq_failed_ || !mmq::built() || !mmq::fits(type, N)) return false;
+    namespace dm = strata::prefill::dense_mmq;
+    constexpr int64_t kRows = dm::kRows, kMaxK = dm::kMaxK;
+    static const bool enabled = dm::enabled_from(std::getenv("STRATA_DENSE_MMQ"));
+    static const int64_t min_t = dm::min_t_from(std::getenv("STRATA_DENSE_MMQ_MIN_T"));
+    if (!enabled || mmq_failed_ || T < min_t) return false;
+    // STRATA_DEQUANT_SIDE: the side stream's next dequant into scratch_ waits only for the last GEMM that read it, not
+    // for this product's FP32 rows there - so the two do not mix (the FP16 path below, as before)
+    if (side_scratch_ != nullptr) return false;
     // K must be a multiple of 256: llama.cpp's MMQ loads the weights in 256-value K chunks, and the
     // chunk past a partial row reads past the row (the next row's bytes - or, for the last weight
     // row, bytes past the tensor, which no caller guarantees to be zeros). The MoE path is safe
     // because its gather buffers carry a zeroed tail; a dense tensor is passed as-is, so a K that
     // is not a full chunk multiple (e.g. the 640-value shared-expert down: 20 blocks of 32) stays on
-    // the dequantize + cuBLAS path.
-    if (K > kMaxK || K % 256 != 0) return false;
-    int64_t R = scratch_elems_ / (2 * K);   // FP32 activations for a chunk fit in the FP16 dequant scratch
-    if (R > kRows) R = kRows;
-    if (R > T) R = T;
+    // the dequantize + cuBLAS path (dense_mmq::shape_ok).
+    // F6: on CUDA only the Q8_0 projections (dense_mmq::type_ok); HIP keeps every type mmq::fits() takes
+#if defined(STRATA_USE_HIP)
+    constexpr bool kHip = true;
+#else
+    constexpr bool kHip = false;
+#endif
+    if (!dm::type_ok(type, kHip)) return false;
+    if (!dm::shape_ok(N, K) || !mmq::built() || !mmq::fits(type, N)) return false;
+    const int64_t R = dm::rows_per_pass(scratch_elems_, K, T);   // FP32 activations for a chunk fit in the FP16 dequant scratch
     if (R < 1) return false;
     if (ldy <= 0) ldy = N;
 
@@ -1282,7 +1292,9 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
         }
         mmq_ctx_ = new mmq::Context();
         mmq::iota((int32_t*) ((uint8_t*) mmq_buf_ + ident_off), kRows, stream_);
-        std::fprintf(stderr, "prefill gemm: dense MMQ on (STRATA_DENSE_MMQ=1)\n");
+        std::fprintf(stderr, "prefill gemm: dense MMQ on (STRATA_DENSE_MMQ=1): the dense %sGGUF projections with K a multiple of "
+                             "256 run as int8 MMQ, activations rounded to q8_1 (not the FP16 path's bits)%s\n",
+                     kHip ? "" : "Q8_0 ", min_t > 0 ? ", from STRATA_DENSE_MMQ_MIN_T rows" : "");
     }
     void* xq = mmq_buf_;
     const int32_t* ident = (const int32_t*) ((uint8_t*) mmq_buf_ + ident_off);
@@ -1390,7 +1402,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
                              "copied unpadded (no device memory)\n", (long long) ldx, (long long) K);
         std::exit(1);
     }
-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+#if defined(STRATA_PREFILL_MMQ)
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
 #endif
 #ifndef STRATA_USE_HIP

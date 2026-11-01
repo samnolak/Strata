@@ -224,7 +224,8 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
     if (i < n) dst[i] = (int32_t) i;
 }
 
-#if defined(__HIPCC__)   // #820: only the HIP dense-MMQ path (Gemm::native_mmq) uses these two
+// #820: only the dense-MMQ path (Gemm::native_mmq, STRATA_DENSE_MMQ) uses these two - HIP, and CUDA since E22 (two
+// one-line kernels in the EAGER-loaded module)
 __global__ void f16_to_f32_kernel(const uint16_t* __restrict__ x, float* __restrict__ y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __half2float(__ushort_as_half(x[i]));
@@ -234,8 +235,6 @@ __global__ void set_bounds_kernel(int32_t* d, int32_t rows) {
     d[0] = 0;
     d[1] = rows;
 }
-
-#endif
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
@@ -260,7 +259,8 @@ __global__ void prep_group_kernel(GuardTab g, int64_t guard, uint8_t* tail_gu, u
 }
 
 // the pointer-table MMQ per type: the native packs' nine types (CMake's _strata_mmq_tab_types, all of them checked
-// bit for bit by prefill_mmq_tab_test).  false: no instance - the optional Q5_0 and K-quant experts keep the gather
+// bit for bit by prefill_mmq_tab_test), and Q6_K in a STRATA_MMQ_KQUANTS build (STRATA_MMQ_TAB_Q6K; its layer still
+// needs supported(14), i.e. the K-quant MMQ on).  false: no instance - Q5_0, Q4_K, Q5_K and Q5_1 keep the gather
 bool run_tab(ggml_backend_cuda_context* ctx, const mmq_args* a, const mmq_x_tab* tab, cudaStream_t s) {
     const ggml_type t = a ? a->type_x : GGML_TYPE_COUNT;
 #define STRATA_TAB_CASE(T) case T: return ctx == nullptr || mul_mat_q_tab_case<T>(*ctx, *a, *tab, s)
@@ -274,6 +274,9 @@ bool run_tab(ggml_backend_cuda_context* ctx, const mmq_args* a, const mmq_x_tab*
         STRATA_TAB_CASE(GGML_TYPE_IQ4_NL);
         STRATA_TAB_CASE(GGML_TYPE_IQ4_XS);
         STRATA_TAB_CASE(GGML_TYPE_Q8_0);
+#if defined(STRATA_MMQ_TAB_Q6K)
+        STRATA_TAB_CASE(GGML_TYPE_Q6_K);
+#endif
         default: return false;
     }
 #undef STRATA_TAB_CASE
@@ -753,7 +756,7 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     ck(cudaGetLastError(), "iota");
 }
 
-#if defined(__HIPCC__)
+// (#820: HIP only before E22's CUDA STRATA_DENSE_MMQ)
 void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
     f16_to_f32_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
@@ -764,6 +767,5 @@ void set_bounds(int32_t* dst, int32_t rows, void* stream) {
     set_bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(dst, rows);
     ck(cudaGetLastError(), "set_bounds");
 }
-#endif
 
 }  // namespace strata::prefill::mmq
