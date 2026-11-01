@@ -9557,7 +9557,7 @@ int main(int argc, char** argv) {
             }
         }
 #endif
-        const bool share_pool = (o.batch <= 0 || batch_cpu_share_env()) && !o.no_pool;
+        const bool share_pool = strata::prefill::share_rules::prompt_paths_get_pool(o.batch, batch_cpu_share_env(), o.no_pool);
         if (o.batch > 0 && batch_cpu_share_env()) {
             const char* sv = std::getenv("STRATA_PREFILL_CPU_SHARE");
             if (o.no_pool)

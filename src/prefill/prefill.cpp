@@ -6,6 +6,7 @@
 #include "strata/kernels/dflash2.hpp"
 #endif
 #include "strata/prefill/warm_policy.hpp"
+#include "strata/prefill/share_rules.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
@@ -278,11 +279,7 @@ std::atomic<int> g_cpu_share_suspend{0};
 // is much faster than the card's link and a chunk of ~500-1500 tokens gives most of its streamed experts 9-30 tokens
 // (512 experts, top-10).  The share's measured split (`auto`) then prices those experts as they are.
 inline int cpu_share_tokens() {
-    static const int v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE_TOKENS");
-        const int d = strata::kernels::cpu::MAXT;
-        return e != nullptr && std::atoi(e) > 0 ? std::clamp(std::atoi(e), 1, 512) : d;
-    }();
+    static const int v = share_rules::share_token_cap(std::getenv("STRATA_PREFILL_CPU_SHARE_TOKENS"), strata::kernels::cpu::MAXT);
     return v;
 }
 double g_pinned_share = 1.0;
@@ -4681,11 +4678,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (!on_cpu[(size_t) e]) continue;
                                     // at most MAXT tokens a job: an expert with more (STRATA_PREFILL_CPU_SHARE_TOKENS)
                                     // runs as several jobs on its blob, its rows in the same order
-                                    const int32_t ne = m.cnt[(size_t) e];
-                                    for (int32_t r0 = 0; r0 < ne; r0 += strata::kernels::cpu::MAXT) {
+                                    share_rules::for_each_share_job(m.cnt[(size_t) e], strata::kernels::cpu::MAXT,
+                                                                    [&](int32_t r0, int32_t nt) {
                                         strata::kernels::cpu::ExpertJobMulti j;
                                         j.blob = cpu_blob[(size_t) e];
-                                        j.nt = std::min<int32_t>(strata::kernels::cpu::MAXT, ne - r0);
+                                        j.nt = nt;
                                         for (int r = 0; r < j.nt; ++r) {
                                             const int64_t p = (int64_t) m.off[(size_t) e] + r0 + r;
                                             if (q2) j.act[r] = &m.cpu_actq[(size_t) src_h[(size_t) p]];
@@ -4693,7 +4690,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                             j.out[r] = m.cpu_rows + (size_t) (p - r0c) * N;
                                         }
                                         m.cpu_jobs.push_back(j);
-                                    }
+                                    });
                                 }
                                 cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
                                 cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -7303,6 +7300,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             std::fprintf(stderr, "strata prefill: layer-major off for this prompt: %s\n", why.c_str());
         }
     }
+    // the CPU share's work in this read, per stage (a line with STRATA_TRACE, only when the CPU took experts)
+    std::vector<std::pair<int64_t, int64_t>> share0;
+    if (hand_in_ == nullptr && cpu_share_on())
+        for (const Prefill* p = this; p != nullptr; p = p->next_) share0.emplace_back(p->stats_.experts_cpu, p->stats_.experts_streamed);
+    const auto share_t0 = std::chrono::steady_clock::now();
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;
@@ -7312,6 +7314,26 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     if (!drain_ok) {
         err = drain_err;
         return false;
+    }
+    if (!share0.empty()) {
+        static const bool trace = std::getenv("STRATA_TRACE") != nullptr;
+        int64_t cpu_sum = 0;
+        size_t i = 0;
+        for (const Prefill* p = this; p != nullptr && i < share0.size(); p = p->next_, ++i) cpu_sum += p->stats_.experts_cpu - share0[i].first;
+        if (trace && cpu_sum > 0) {
+            std::string per;
+            i = 0;
+            for (const Prefill* p = this; p != nullptr && i < share0.size(); p = p->next_, ++i) {
+                char b[160];
+                std::snprintf(b, sizeof b, "%s%lld/%lld (%.2f)", i ? ", " : "", (long long) (p->stats_.experts_cpu - share0[i].first),
+                              (long long) (p->stats_.experts_cpu - share0[i].first + p->stats_.experts_streamed - share0[i].second),
+                              p->stats_.cpu_share);
+                per += b;
+            }
+            std::fprintf(stderr, "strata prefill: CPU share: %lld tokens in %.0f ms; experts on the CPU / of the non-resident, per "
+                                 "stage (share): %s\n", (long long) n,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - share_t0).count(), per.c_str());
+        }
     }
     // STRATA_MMQ_DIRECT=1 with STRATA_MMQ_DIRECT_LOG=1 (a check, not a default): each stage's totals so far - how many
     // resident experts its prompt MMQ read in their slots, of all its resident and streamed ones
