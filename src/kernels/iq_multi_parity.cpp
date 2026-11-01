@@ -66,6 +66,7 @@ const char* name_of(int t) {
         case 13: return "Q5_K";
         case 7: return "Q5_1";
         case 8: return "Q8_0";
+        case 14: return "Q6_K";
         default: return "?";
     }
 }
@@ -83,6 +84,11 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
             // sign and the exponent's top bits: 0x1 / 0x2 (or 0x9 / 0xA) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t) ((sgn(rng) == 0 ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
             w[o + 55] = (uint8_t) ((w[o + 55] & 0x0F) | (nib << 4));
+        } else if (t == 14) {
+            // Q6_K: ql[128] qh[64] scales[16] (int8: any byte is a valid scale) and the fp16 d LAST (bytes 208..209);
+            // |scale x code| reaches 128 x 32 (Q4_K: 63 x 15), so d one octave lower: 2^-14 .. 2^-7
+            const uint16_t h = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | ((ex(rng) - 1) << 10) | man(rng));
+            std::memcpy(&w[o + 208], &h, 2);
         } else {
             const uint16_t h = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));   // 2^-13 .. 2^-6
             std::memcpy(&w[o], &h, 2);
@@ -430,6 +436,16 @@ int main(int argc, char** argv) {
     for (int gu : {12, 13})
         for (int dt : {7, 8}) check_grouped(gu, dt, 2560, 640, s, rng);
     for (int gu : {12, 13}) check_grouped(gu, 13, 2048, 512, s, rng);   // Qwen3.6-35B-A3B's geometry
+    // Q8_0 gate/up (UD-Q6_K_XL's layer 2, the rt-q8 drafter's experts): 320 calls a row at 2560, the full-warp rows - with
+    // STRATA_KQ_SPLIT=1 a 16-row grid left the up rows unwritten (native_expert_grouped's gu_sub16_rows)
+    check_grouped(8, 8, 2560, 640, s, rng);
+#ifdef STRATA_Q6K_EXPERTS
+    // UD-Q6_K_XL / UD-Q5_K_XL: Q6_K gate/up with Q8_0 down (STRATA_Q6K_SPLIT=1 compares Split<14>'s decode-once kernels
+    // with the per-entry ones; without it both runs take the old kernels), and Qwen3.6-35B's Q6_K down
+    check_grouped(14, 8, 2560, 640, s, rng);
+    check_grouped(14, 14, 2048, 512, s, rng);
+    check_grouped(12, 14, 2048, 512, s, rng);
+#endif
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
