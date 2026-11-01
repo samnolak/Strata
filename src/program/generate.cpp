@@ -753,6 +753,10 @@ struct Options {
     /// CUDA device in the engine's order, -1 = not given (that device keeps the two flags above).  Empty = not used.
     std::vector<int64_t> vram_reserve_per_dev;
     std::string vram_reserve_per_dev_arg;   ///< the list as given on the command line ("" = read the environment)
+    /// --vram-reserve-mib as the flag (or the default) gave it before the primary card's item replaced it, -1 = not
+    /// replaced (then vram_reserve_mib still is it): the fallback of a later device the list gives no item
+    /// (stage_reserve::device_reserve / flag_reserve)
+    int64_t vram_reserve_flag_mib = -1;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  A chunk of
@@ -3863,11 +3867,9 @@ int main(int argc, char** argv) {
                 return 2;
             }
             const int vram_reserve_flag = o.vram_reserve_mib;   // as the flag (or the default) left it, for the log
-            const int64_t first = strata::program::stage_reserve::per_dev_value(o.vram_reserve_per_dev, primary_device);
-            if (first >= 0) {
-                o.vram_reserve_mib = (int) first;
-                o.vram_reserve_given = true;
-            }
+            // the primary card's item replaces --vram-reserve-mib; the flag's value is kept for the later devices
+            o.vram_reserve_flag_mib = strata::program::stage_reserve::apply_primary(o.vram_reserve_per_dev, primary_device,
+                                                                                   o.vram_reserve_mib, o.vram_reserve_given);
             int n_vis = 1;
             if (cudaGetDeviceCount(&n_vis) != cudaSuccess || n_vis < 1) n_vis = 1;
             (void) cudaGetLastError();
@@ -3878,8 +3880,9 @@ int main(int argc, char** argv) {
                 const int d = used[i];
                 const bool later = i > 0;
                 const int64_t mine = strata::program::stage_reserve::per_dev_value(o.vram_reserve_per_dev, d);
-                const int64_t r = strata::program::stage_reserve::base_reserve_for(
-                    d, later, vram_reserve_flag, o.vram_reserve_later_mib, o.vram_reserve_per_dev);
+                const int64_t r = strata::program::stage_reserve::device_reserve(   // what stage_room / the serve check use
+                    d, later, primary_device, o.vram_reserve_mib, o.vram_reserve_flag_mib, o.vram_reserve_later_mib,
+                    o.vram_reserve_per_dev);
                 line += (line.empty() ? "" : ", ") + std::string("CUDA") + std::to_string(d) + " " + std::to_string((long long) r) +
                         " MiB" + (mine >= 0 ? "" : later && o.vram_reserve_later_mib >= 0 ? " (--vram-reserve-later-mib)"
                                                                                             : " (--vram-reserve-mib)");
@@ -5524,9 +5527,11 @@ int main(int argc, char** argv) {
                          cudaGetErrorString(e));
         const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
         // p55/final2-c: the device's own value when --vram-reserve-per-dev / STRATA_VRAM_RESERVE_PER_DEV gives one (dev -1 =
-        // CUDA0, whose value is o.vram_reserve_mib already); otherwise exactly the old expression
-        const int64_t base_reserve = strata::program::stage_reserve::base_reserve_for(
-            dev < 0 ? 0 : dev, later, o.vram_reserve_mib, o.vram_reserve_later_mib, o.vram_reserve_per_dev);
+        // the primary card, whose item is o.vram_reserve_mib already); a later device without one falls back to the
+        // flag's own --vram-reserve-mib (o.vram_reserve_flag_mib), not the primary's item; unset list = the old expression
+        const int64_t base_reserve = strata::program::stage_reserve::device_reserve(
+            dev, later, primary_device, o.vram_reserve_mib, o.vram_reserve_flag_mib, o.vram_reserve_later_mib,
+            o.vram_reserve_per_dev);
         strata::program::stage_reserve::Inputs rin;
         rin.base_reserve_mib = base_reserve;
         rin.prompt_buffers_mib = pf;
@@ -12753,8 +12758,9 @@ int main(int argc, char** argv) {
                 size_t sf = 0, stot = 0;
                 if (cudaMemGetInfo(&sf, &stot) != cudaSuccess) { (void) cudaGetLastError(); continue; }
                 const int64_t sf_mib = (int64_t) (sf >> 20);
-                const int later_reserve = (int) strata::program::stage_reserve::base_reserve_for(
-                    stp->dev, true, o.vram_reserve_mib, o.vram_reserve_later_mib, o.vram_reserve_per_dev);   // p55/final2-c
+                const int later_reserve = (int) strata::program::stage_reserve::device_reserve(   // p55/final2-c
+                    stp->dev, true, primary_device, o.vram_reserve_mib, o.vram_reserve_flag_mib, o.vram_reserve_later_mib,
+                    o.vram_reserve_per_dev);
                 if (sf_mib >= 512)
                     std::fprintf(stderr, "strata serve: CUDA%d: %lld MiB of VRAM free with everything loaded\n", stp->dev,
                                  (long long) sf_mib);

@@ -176,6 +176,71 @@ int main() {
         z.base_reserve_mib = base_reserve_for(0, true, 0, -1, std::vector<int64_t>{40000});
         check(room_bytes(fb1, z) == 0, "4080 rig: an oversized reserve -> room 0");
     }
+    // ---- generate.cpp's flow (apply_primary at start-up, then device_reserve in the start-up log, stage_room and the
+    // serve-time LOW check): a later device without an item falls back to the FLAG's --vram-reserve-mib, never to the
+    // primary card's item (review: 13058d48 overwrote o.vram_reserve_mib with CUDA0's item and stage_room then used it)
+    {
+        // the reviewer's repro: "3584,-,-,6656" with --vram-reserve-mib 4608: CUDA1/2 keep 4608 (the log said 4608,
+        // stage_room used 3584)
+        std::vector<int64_t> pd;
+        std::string e;
+        check(parse_per_dev("3584,-,-,6656", pd, e), "flow: parse the repro list");
+        int vr = 4608;
+        bool given = true;
+        const int64_t flag = apply_primary(pd, 0, vr, given);
+        check(vr == 3584 && given && flag == 4608, "flow: CUDA0's item replaces --vram-reserve-mib, the flag is kept");
+        check(device_reserve(-1, false, 0, vr, flag, -1, pd) == 3584, "flow: stage_room(-1) = CUDA0's item");
+        check(device_reserve(0, false, 0, vr, flag, -1, pd) == 3584, "flow: CUDA0 = its item");
+        check(device_reserve(1, true, 0, vr, flag, -1, pd) == 4608, "flow: CUDA1 '-' -> the flag 4608, not CUDA0's 3584");
+        check(device_reserve(2, true, 0, vr, flag, -1, pd) == 4608, "flow: CUDA2 '-' -> the flag 4608");
+        check(device_reserve(3, true, 0, vr, flag, -1, pd) == 6656, "flow: CUDA3 its item");
+        check(device_reserve(5, true, 0, vr, flag, -1, pd) == 4608, "flow: past the end -> the flag");
+        check(device_reserve(1, true, 0, vr, flag, 1800, pd) == 1800, "flow: CUDA1 '-' -> --vram-reserve-later-mib when given");
+        // an item that is not given for the primary card: nothing is overridden, the auto paths may still adapt it
+        int vr2 = 700;
+        bool given2 = false;
+        const int64_t flag2 = apply_primary(std::vector<int64_t>{-1, 2816}, 0, vr2, given2);
+        check(flag2 == -1 && vr2 == 700 && !given2, "flow: no CUDA0 item -> nothing replaced, not 'given'");
+        vr2 = 512;   // e.g. the expert cache auto path adapted the reserve (generate.cpp ~7250)
+        check(device_reserve(-1, false, 0, vr2, flag2, -1, std::vector<int64_t>{-1, 2816}) == 512, "flow: adapted CUDA0 kept");
+        check(device_reserve(2, true, 0, vr2, flag2, -1, std::vector<int64_t>{-1, 2816}) == 512,
+              "flow: no override -> later devices follow the (adapted) --vram-reserve-mib as before");
+        check(device_reserve(1, true, 0, vr2, flag2, -1, std::vector<int64_t>{-1, 2816}) == 2816, "flow: CUDA1 its item");
+        // STRATA_PRIMARY_DEVICE=2: the primary's item is item 2, and stage_room's dev -1 means CUDA2, not CUDA0
+        int vr3 = 4608;
+        bool given3 = false;
+        const std::vector<int64_t> pd3{1000, 2000, 3000, -1};
+        const int64_t flag3 = apply_primary(pd3, 2, vr3, given3);
+        check(vr3 == 3000 && flag3 == 4608 && given3, "flow: primary CUDA2 -> its item 3000");
+        check(device_reserve(-1, false, 2, vr3, flag3, -1, pd3) == 3000, "flow: primary CUDA2: stage_room(-1) = item 2");
+        check(device_reserve(3, true, 2, vr3, flag3, -1, pd3) == 4608, "flow: primary CUDA2: CUDA3 '-' -> the flag");
+        check(device_reserve(0, true, 2, vr3, flag3, -1, pd3) == 1000, "flow: primary CUDA2: CUDA0 as a later stage = item 0");
+        // the grid: for every list / flag / later flag / primary, device_reserve = the item when given, else the old rule
+        // with the flag's value (and with no list at all, exactly the old expression with the current vram_reserve_mib)
+        const std::vector<std::vector<int64_t>> lists{{}, {3584}, {3584, -1, -1, 6656}, {-1, 2816, 2816, 6656},
+                                                      {3584, 2816, 2816, 6656}, {0, -1}, {-1, -1, 5000}};
+        for (const auto& L : lists)
+            for (int prim = 0; prim < 3; ++prim)
+                for (int fl : {0, 700, 4608})
+                    for (int64_t vl : {int64_t(-1), int64_t(0), int64_t(1400)})
+                        for (int dev = -1; dev < 6; ++dev)
+                            for (int later = 0; later < 2; ++later) {
+                                if (dev >= 0 && dev == prim && later) continue;   // the primary card is never a later stage
+                                int v = fl;
+                                bool gv = false;
+                                const int64_t fm = apply_primary(L, prim, v, gv);
+                                const int d = dev < 0 ? prim : dev;
+                                const int64_t item = d < (int) L.size() ? L[(size_t) d] : -1;
+                                const int64_t want = item >= 0 ? item : (later && vl >= 0 ? vl : fl);
+                                ++cases;
+                                check(device_reserve(dev, later != 0, prim, v, fm, vl, L) == want,
+                                      "flow grid: dev " + std::to_string(dev) + " primary " + std::to_string(prim) + " flag " +
+                                          std::to_string(fl) + " later " + std::to_string(later));
+                                if (L.empty())
+                                    check(device_reserve(dev, later != 0, prim, v, fm, vl, L) == (later && vl >= 0 ? vl : v),
+                                          "flow grid: unset list = the old expression");
+                            }
+    }
     std::printf("stage_reserve_test: %ld cases, %s\n", cases, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

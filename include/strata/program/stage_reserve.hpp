@@ -111,6 +111,40 @@ inline int64_t base_reserve_for(int dev, bool later, int64_t vram_reserve_mib, i
     return later && vram_reserve_later_mib >= 0 ? vram_reserve_later_mib : vram_reserve_mib;
 }
 
+// generate.cpp's flow, factored here so stage_reserve_test covers it.  At start-up the primary card's item (when the list
+// gives one) replaces --vram-reserve-mib, so every first-card sizing path follows it; the flag's own value is kept apart
+// (Options::vram_reserve_flag_mib) because it stays the fallback of every LATER device whose item is empty, "-" or past
+// the end - not the primary card's item.
+
+/// The start-up step: the primary card's item when the list gives one.  `vram_reserve_mib` / `given` are updated in place
+/// and the flag's value before the override is returned (the fallback for later devices), or -1 when nothing was
+/// overridden (then `vram_reserve_mib` still is the flag's value, also after the auto paths adapt it).
+inline int64_t apply_primary(const std::vector<int64_t>& per_dev, int primary_device, int& vram_reserve_mib, bool& given) {
+    const int64_t first = per_dev_value(per_dev, primary_device);
+    if (first < 0) return -1;
+    const int64_t flag = vram_reserve_mib;
+    vram_reserve_mib = (int) first;
+    given = true;
+    return flag;
+}
+
+/// --vram-reserve-mib as the flag (or the default / the auto paths) gave it: `flag_mib` when apply_primary() overrode
+/// it (>= 0), else the current `vram_reserve_mib`.
+inline int64_t flag_reserve(int64_t vram_reserve_mib, int64_t flag_mib) {
+    return flag_mib >= 0 ? flag_mib : vram_reserve_mib;
+}
+
+/// The base reserve generate.cpp uses for device `dev` (-1 = the primary card, as stage_room's first stage passes it):
+/// the primary card on a first stage keeps the current `vram_reserve_mib` (its item, or the flag); every other device
+/// takes base_reserve_for() with the FLAG's value as the fallback, never the primary card's item.  With an empty list
+/// this is exactly the old expression (later && later_mib >= 0 ? later_mib : vram_reserve_mib).
+inline int64_t device_reserve(int dev, bool later, int primary_device, int64_t vram_reserve_mib, int64_t flag_mib,
+                              int64_t vram_reserve_later_mib, const std::vector<int64_t>& per_dev) {
+    const int d = dev < 0 ? primary_device : dev;
+    if (d == primary_device && !later) return vram_reserve_mib;
+    return base_reserve_for(d, later, flag_reserve(vram_reserve_mib, flag_mib), vram_reserve_later_mib, per_dev);
+}
+
 // ---------------------------------------------------------------------------------------------------- the proposal
 constexpr int64_t kGraphMib = 6;            ///< one window graph, captured on first use (log of #3702: 4, 6, 6)
 constexpr int64_t kInstantiateBurstMib = 48; ///< the largest single step seen (42 MiB in #3702): room kept for one more
