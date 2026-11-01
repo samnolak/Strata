@@ -145,6 +145,10 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 /// thread has one for the card or a finished thread left one in the pool. A restore writes into buffers that exist
 /// already; a new stream is the one thing it can allocate (see program/conv_cache.hpp restore_fits).
 bool conversation_copy_stream_ready(int device);
+/// STRATA_STAGE_COPY_PARALLEL: gives the calling thread its copy stream on CUDA device `device` now (`device` must be the
+/// current one), so a stage worker's later restores create none on a card the expert cache has filled.  True: the
+/// thread has one (conversation_copy_stream_ready(device) is true on it from now on).
+bool conversation_copy_stream_prepare(int device);
 enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.

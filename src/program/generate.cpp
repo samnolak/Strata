@@ -6420,8 +6420,35 @@ int main(int argc, char** argv) {
         return true;
     }();
     std::unique_ptr<strata::core::StagePool> stage_pool;
-    if (stage_copy_parallel && !stages.empty())
-        stage_pool = std::make_unique<strata::core::StagePool>(1 + stages.size());
+    // STRATA_STAGE_COPY_PARALLEL: worker k (k == 0: CUDA0, else stages[k - 1]) has its copy stream on that card (#2409)
+    std::vector<uint8_t> stage_pool_streams;
+    if (stage_copy_parallel && !stages.empty()) {
+        // The workers go where StageThreads' do (wide, then the aux CPUs): the host thread is pinned to one CPU once the
+        // CPU pool starts, and a thread it creates inherits that CPU, where the stages' host copies would take turns.
+        stage_pool = std::make_unique<strata::core::StagePool>(1 + stages.size(), [](size_t k) {
+            strata::platform::name_this_thread("strata-stcopy", (int) k);
+            StageThreads::spread_current_thread();
+        });
+        // #2409: a restore must not create a copy stream on a card the expert cache has filled (an out-of-memory there
+        // ends the process).  Worker k always copies on the same card (the bodies are in stage order), so it creates its
+        // stream now, before the cache takes the memory; the restore check below asks for the worker's stream.
+        stage_pool_streams.assign(1 + stages.size(), 0);
+        std::vector<std::function<bool(std::string&)>> warm(1 + stages.size());
+        for (size_t k = 0; k < warm.size(); ++k)
+            warm[k] = [&, k](std::string&) {
+                const int dev = k == 0 ? 0 : stages[k - 1]->dev;
+                const strata::core::OnDevice on(dev);
+                stage_pool_streams[k] = strata::core::conversation_copy_stream_prepare(dev) ? 1 : 0;
+                return true;
+            };
+        std::string warm_err;
+        (void) stage_pool->run(warm, warm_err);
+        size_t ready = 0;
+        for (const uint8_t r : stage_pool_streams) ready += r;
+        std::fprintf(stderr, "strata generate: STRATA_STAGE_COPY_PARALLEL=1: %zu stage copy workers (parks, parked restores, "
+                             "slot copies and checkpoint mounts copy every stage at once); %zu of %zu have their copy stream\n",
+                     warm.size(), ready, warm.size());
+    }
     const bool stage_copy_trace = [] {
         const char* v = std::getenv("STRATA_STAGE_COPY_TRACE");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -15449,7 +15476,11 @@ int main(int argc, char** argv) {
                         break;
                     }
                     restore_free.push_back((uint64_t) fb);
-                    restore_ready.push_back(strata::core::conversation_copy_stream_ready(cur) ? 1 : 0);
+                    // STRATA_STAGE_COPY_PARALLEL: the restore runs on stage worker k, whose stream was made at start-up
+                    const size_t wk = restore_ready.size();
+                    const bool stream_ready = stage_pool ? wk < stage_pool_streams.size() && stage_pool_streams[wk] != 0
+                                                         : strata::core::conversation_copy_stream_ready(cur);
+                    restore_ready.push_back(stream_ready ? 1 : 0);
                 }
                 if (sampled &&
                     !strata::program::conv_cache::restore_fits(restore_free.data(), restore_ready.data(), restore_free.size(),
@@ -15875,8 +15906,29 @@ int main(int argc, char** argv) {
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
-                           [&] {
+                } else if (c == nullptr ||
+                           [&] {   // true: the mount failed
+                               if (stage_pool && c->stage_parts.size() == stages.size()) {
+                                   // STRATA_STAGE_COPY_PARALLEL: every stage's running state at once, each on its own
+                                   // worker and card (the same copies as below)
+                                   std::vector<std::function<bool(std::string&)>> bodies(1 + stages.size());
+                                   bodies[0] = [&](std::string& e) {
+                                       const strata::core::OnDevice on(0);
+                                       if (checkpoint_restore(*c, ss, g)) return true;
+                                       e = "CUDA0";
+                                       return false;
+                                   };
+                                   for (size_t i = 0; i < stages.size(); ++i)
+                                       bodies[i + 1] = [&, i](std::string& e) {
+                                           const strata::core::OnDevice on(stages[i]->dev);
+                                           if (checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
+                                           e = "stage CUDA" + std::to_string(stages[i]->dev);
+                                           return false;
+                                       };
+                                   std::string e;
+                                   return !stage_pool_run(bodies, e, "checkpoint_mount");
+                               }
+                               if (!checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size()) return true;
                                for (size_t i = 0; i < stages.size(); ++i) {
                                    const strata::core::OnDevice on(stages[i]->dev);
                                    if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;

@@ -16,12 +16,22 @@ namespace strata::core {
 
 class StagePool {
 public:
-    explicit StagePool(size_t stages) {
+    /// `on_start` (optional) runs first thing on each worker thread, with the worker's index, before it takes any body:
+    /// where the thread runs and its name (the engine's host thread is pinned to one CPU and a thread it creates
+    /// inherits that CPU, where the stages' host copies would only take turns).  It must not throw; an exception from
+    /// it is swallowed and the worker runs anyway.
+    explicit StagePool(size_t stages, std::function<void(size_t)> on_start = {}) {
         slots_.reserve(stages);
         workers_.reserve(stages);
         for (size_t k = 0; k < stages; ++k) slots_.push_back(std::make_unique<Slot>());
         try {
-            for (size_t k = 0; k < stages; ++k) workers_.emplace_back([this, k] { work(k); });
+            for (size_t k = 0; k < stages; ++k)
+                workers_.emplace_back([this, k, on_start] {
+                    if (on_start) {
+                        try { on_start(k); } catch (...) {}
+                    }
+                    work(k);
+                });
         } catch (...) {
             stop_and_join();
             throw;

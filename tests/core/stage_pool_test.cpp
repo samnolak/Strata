@@ -187,6 +187,31 @@ int main() {
         // pool-> dereference racing the reset. The stop/wakeup races the fix targets are
         // covered by the hammer block above (stop_and_join races the workers' wait states).
     }
+    {
+        // on_start (the engine's CPU placement and thread name): once per worker, on the worker's own thread, before
+        // the worker takes a body; a throwing hook leaves the worker running
+        std::mutex mu;
+        std::vector<std::thread::id> started(3);
+        std::vector<int> calls(3, 0);
+        StagePool pool(3, [&](size_t k) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                started[k] = std::this_thread::get_id();
+                ++calls[k];
+            }
+            if (k == 2) throw std::runtime_error("placement failed");
+        });
+        std::vector<std::thread::id> ran(3);
+        std::vector<std::function<bool(std::string&)>> bodies(3);
+        for (size_t k = 0; k < bodies.size(); ++k)
+            bodies[k] = [&, k](std::string&) { ran[k] = std::this_thread::get_id(); return true; };
+        std::string error;
+        for (int round = 0; round < 3; ++round) check(pool.run(bodies, error), "runs with a start hook complete");
+        std::lock_guard<std::mutex> lk(mu);
+        check(calls == std::vector<int>(3, 1), "the start hook runs once per worker");
+        check(started == ran, "the start hook runs on the thread that runs the stage's bodies");
+        check(std::find(ran.begin(), ran.end(), std::this_thread::get_id()) == ran.end(), "no body runs on the caller");
+    }
     if (failures == 0) std::fprintf(stderr, "stage_pool_test: ok\n");
     return failures == 0 ? 0 : 1;
 }
