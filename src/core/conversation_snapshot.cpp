@@ -423,6 +423,7 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
 
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error, bool queued) {
+    if (!qsa_kv_host_ensure(to, upto + 64, &error)) return false;   // kv-lean: the lazy host K/V it writes
     Layout lf{}, lt{};
     if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error) ||
         !layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;
@@ -454,6 +455,7 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
 
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                              int64_t upto, bool index, std::string& error) {
+    if (!qsa_kv_host_ensure(st, upto + 64, &error)) return false;   // kv-lean: the lazy host K/V it writes
     // STRATA_PARK_VRAM_MIB: from the image's VRAM slot when it holds every part (no host buffer is read: no join)
     const VramKvSlot* slot = vram_kv_find(image.dev_tag);
     if (slot == nullptr) conversation_park_join();
@@ -477,6 +479,7 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
 
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                                     int64_t captured, int64_t upto, bool index, std::string& error) {
+    if (!qsa_kv_host_ensure(st, upto + 64, &error)) return false;   // kv-lean: the lazy host K/V it writes
     const VramKvSlot* slot = vram_kv_find(image.dev_tag);   // (STRATA_PARK_VRAM_MIB, as in conversation_kv_restore)
     if (slot == nullptr) conversation_park_join();
     if (upto < 0 || upto > captured) {

@@ -59,9 +59,11 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     uint64_t n = 0;
     n += gdn_buffers_bytes(g);
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
-    // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
+    // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).  kv-lean
+    // (STRATA_ROPE_SHARE=1): none does when the device already has a table this long - session_init borrows it.
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
+        n += qsa_state_bytes(g, max_cells, qsa_rope_shared(max_cells) == nullptr) +
+             (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
@@ -100,7 +102,10 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
+    // kv-lean (STRATA_ROPE_SHARE=1): the device's table, when one this long exists, is borrowed by the primary too
+    // (session_bytes sized the arena the same way: both ask before this session registers anything)
+    const QsaState* rope_dev = qsa_rope_shared(max_cells);
+    const uint64_t first = qsa_state_bytes(g, max_cells, rope_dev == nullptr), rest = qsa_state_bytes(g, max_cells, false);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
@@ -110,8 +115,9 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? rope_dev : &s.qsa_states[s.qsa_ord0]) == 0)
             return 0;
+    if (s.qsa_alloc > 0 && rope_dev == nullptr) qsa_rope_share_register(s.qsa_states[s.qsa_ord0], g.n_rot);
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 
     s.moe_arena = take(moe_buffers_bytes(g, k));
@@ -123,6 +129,13 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.ple_hist = (float*) take(ple_hist_bytes());
     s.R = s.block.R;
     return used;
+}
+
+bool session_kv_ensure(const SessionState& s, int64_t cells, std::string* err) {
+    if (!qsa_kv_host_lazy() || s.qsa_states == nullptr) return true;
+    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+        if (!qsa_kv_host_ensure(s.qsa_states[s.qsa_ord0 + j], cells, err)) return false;
+    return true;
 }
 
 void session_release(SessionState& s) {

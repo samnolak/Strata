@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/kernels/kv_host_pieces.hpp"
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -145,7 +146,11 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bo
     cudaStream_t s = nullptr;
     cudaError_t e = private_stream(s);
     if (e != cudaSuccess) return e;
-    e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
+    // kv-lean: a lazy host K/V copy is registered in pieces and a copy may not span two (kv_host_pieces.hpp); one call
+    // when neither side is a lazy copy
+    e = (cudaError_t) strata::kernels::kv_host_copy_pieces(dst, src, bytes, [&](void* d, const void* x, size_t k) {
+        return (int) cudaMemcpyAsync(d, x, k, cudaMemcpyDefault, s);
+    });
     if (e != cudaSuccess || queued) return e;
     e = cudaStreamSynchronize(s);
     core::progress_beat();   // #2049: a parked conversation is many of these; each one that lands is progress

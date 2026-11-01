@@ -2950,6 +2950,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
+    // kv-lean (STRATA_KV_HOST_LAZY=1): the cells this read writes are pinned in the session's host K/V first
+    if (!core::session_kv_ensure(ss, pos0 + n + 64, &err)) return false;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
     // STRATA_KVA: the approximate-prefix plan of this run, if it qualifies (a cold read of one long prompt, one
@@ -6225,6 +6227,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         return (size_t) depth < sg.stage_ss.size() && sg.stage_ss[(size_t) depth] != nullptr ? sg.stage_ss[(size_t) depth] : m.ss;
     };
     core::SessionState* ssp = ss_of(0);
+    // kv-lean (STRATA_KV_HOST_LAZY=1): every segment's cells pinned in its session's host K/V before they are written
+    for (size_t i = 0; i < segs.size(); ++i)
+        if (!core::session_kv_ensure(*ss_of(i), segs[i].pos0 + segs[i].n + 64, &err)) return false;
     const bool multi = segs.size() > 1;
     int64_t n = 0;                       // all the prompts' tokens
     for (const Seg& sg : segs) n += sg.n;

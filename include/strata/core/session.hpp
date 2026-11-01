@@ -103,6 +103,10 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
+/// kv-lean (STRATA_KV_HOST_LAZY=1): pins every lazy host K/V copy of the session's QSA states for cells [0, cells)
+/// (qsa_kv_host_ensure).  Called before anything writes cells of the session: the prompt path, the verify windows, the
+/// server before a request (its prompt and max_new).  true at once when the switch is off.
+bool session_kv_ensure(const SessionState& s, int64_t cells, std::string* err = nullptr);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
