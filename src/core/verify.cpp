@@ -97,6 +97,9 @@ bool window_run_slots(void* w, const int* rows, int S, const int32_t* tokens, co
 #endif
 
 namespace strata::core {
+// kv-lean: cells pinned past a window's last one, so a block written whole (4 cells) and the next window's first
+// rows never reach past the lazy host K/V (qsa_kv_host_ensure grows it in whole steps anyway)
+constexpr int64_t kLazyKvMargin = 64;
 namespace {
 
 constexpr float EPS = 1e-6f;
@@ -3018,6 +3021,7 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (T < 1 || T > max_t_ || exec_t == nullptr) { err = "verify: prelaunch before the window was captured"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (pos0 + T > ss_->qsa_states[ss_->qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (!session_kv_ensure(*ss_, pos0 + T + kLazyKvMargin, &err)) return false;   // kv-lean: the lazy host K/V
     const Clock::time_point t0 = Clock::now();
     stage_inputs(T, tokens, pos0);
     if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);
@@ -3067,6 +3071,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (!session_kv_ensure(ss, pos0 + T + kLazyKvMargin, &err)) return false;   // kv-lean: the lazy host K/V
     // the overlapped split launched this stage's window already: keep the graph variant (#871) chosen for it then,
     // or this thread would serve the window as the other variant
     const bool pre = prelaunched_ == T;
@@ -4322,6 +4327,9 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             err = "verify: slot " + std::to_string(rows[t]) + " runs past its context";
             return false;
         }
+    if (qsa_kv_host_lazy())   // kv-lean: the lazy host K/V of every row's slot reaches past its cell
+        for (int t = 0; t < S; ++t)
+            if (!session_kv_ensure(*slots_[(size_t) rows[t]], pos[t] + 1 + kLazyKvMargin, &err)) return false;
     refresh_ar();
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
@@ -4879,6 +4887,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (!session_kv_ensure(ss, pos0 + T + kLazyKvMargin, &err)) return false;   // kv-lean: the lazy host K/V
     const int sl = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;   // the variant this window's context pays off with
     if (exec_[sl][T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
         err = "verify: pipelined window not prepared (capture_all)";

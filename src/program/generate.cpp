@@ -6354,6 +6354,11 @@ int main(int argc, char** argv) {
                          (double) bytes0 * o.batch / 1073741824.0);
         }
     }
+    if (strata::core::qsa_kv_host_lazy() && strata::core::qsa_kv_host_reserved_bytes() > 0)
+        std::fprintf(stderr, "strata generate: STRATA_KV_HOST_LAZY=1: the host K/V copies of every session reserve %.2f GiB "
+                             "of address space and hold %.2f GiB of pinned RAM now (the rest is pinned as contexts grow)\n",
+                     (double) strata::core::qsa_kv_host_reserved_bytes() / 1073741824.0,
+                     (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
 
     // STRATA_PIPED_MTP is decided again now that the slots that fit and the groups are final.  Recommend, never force: when
     // it cannot run it is said and left off, and --batch-mtp goes on as it would without it.
@@ -14779,6 +14784,25 @@ int main(int argc, char** argv) {
             if (req_prefill_only && (geni || o.batch > 0 || n < 2)) {
                 std::printf("ERR prefill=1 needs a text prompt of at least 2 tokens and no --batch\n");
                 continue;
+            }
+            // kv-lean (STRATA_KV_HOST_LAZY=1): before anything of this request runs, pin the host K/V it can reach (its
+            // prompt + max_new + a margin) in every session that may hold it: the main one, every stage's, and the batch
+            // slot it is admitted to.  The prompt path, the verify windows and the conversation copies ensure it again for
+            // what they write, so this only keeps the pinning out of the decode loop.
+            if (strata::core::qsa_kv_host_lazy()) {
+                const int64_t need = std::min<int64_t>(o.max_context, n + std::max<long long>(max_new, 0) + 256);
+                std::string le;
+                bool ok = strata::core::session_kv_ensure(ss, need, &le);
+                for (size_t k = 0; ok && k < stages.size(); ++k) ok = strata::core::session_kv_ensure(stages[k]->ss, need, &le);
+                if (admit_slot >= 0)
+                    for (size_t k = 0; ok && k < bslot_ss.size(); ++k)
+                        if ((size_t) admit_slot < bslot_ss[k].size())
+                            ok = strata::core::session_kv_ensure(*bslot_ss[k][(size_t) admit_slot], need, &le);
+                if (!ok) {
+                    std::printf("ERR %s\n", le.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
             }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }

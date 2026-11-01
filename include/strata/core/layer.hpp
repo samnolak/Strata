@@ -239,6 +239,9 @@ struct QsaState {
     /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
+    /// kv-lean (STRATA_KV_HOST_LAZY=1): a streamed state's host copy that is pinned as the context grows - its index in
+    /// layer.cpp's registry (qsa_kv_host_ensure); -1: the whole copy pinned at start, as before.
+    int32_t host_lazy = -1;
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
@@ -289,6 +292,18 @@ const QsaState* qsa_rope_shared(int64_t max_cells);
 /// Registers `owner`'s table (owner.owns_rope) for the current device when the switch is on and the device has no
 /// table covering as many positions yet.  The owner must outlive every borrower (sessions live as long as the process).
 void qsa_rope_share_register(const QsaState& owner, int64_t n_rot);
+/// kv-lean, opt-in STRATA_KV_HOST_LAZY=1: a streamed state's host K/V copy (the authoritative K/V of every cell, the
+/// largest pinned allocation of a long-context --batch run: 9,792 B per cell and session at k8v4) gets addresses for
+/// the whole context at start but pinned RAM only for the cells reached, 16384 at first (STRATA_KV_HOST_LAZY_INIT)
+/// and then in steps of 16384 (STRATA_KV_HOST_LAZY_STEP).  The bytes and their addresses are the ones the whole
+/// copy has, so outputs are the same.  Unset: the whole copy pinned at start, exactly as before.
+bool qsa_kv_host_lazy();
+/// Pins `st`'s host copy for cells [0, cells) if it is lazy and not pinned that far (whole steps, at most max_cells).
+/// Every writer of a host copy calls it first (session_kv_ensure: the prompt path, the verify windows, the copies
+/// and restores of conversation state).  false: the RAM could not be pinned (`err` says so).  No-op for others.
+bool qsa_kv_host_ensure(const QsaState& st, int64_t cells, std::string* err = nullptr);
+/// Address space the lazy host copies reserved (their full size); qsa_kv_host_bytes() is what is pinned now.
+uint64_t qsa_kv_host_reserved_bytes();
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully

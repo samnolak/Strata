@@ -131,6 +131,13 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     return used;
 }
 
+bool session_kv_ensure(const SessionState& s, int64_t cells, std::string* err) {
+    if (!qsa_kv_host_lazy() || s.qsa_states == nullptr) return true;
+    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+        if (!qsa_kv_host_ensure(s.qsa_states[s.qsa_ord0 + j], cells, err)) return false;
+    return true;
+}
+
 void session_release(SessionState& s) {
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (s.qsa_states[j].owns_rope) {
