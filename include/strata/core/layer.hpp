@@ -277,6 +277,18 @@ struct QsaState {
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+/// kv-lean, opt-in STRATA_ROPE_SHARE=1: ONE RoPE table per device for every session on it.  The table depends only
+/// on (n_rot, the process's rope scaling, position) - never on the session or on max_cells beyond its length - so the
+/// batch slots' sessions, which each built their own copy (max_cells x 256 B per session and stage: 96 MiB at 384K,
+/// 8 slots per card), borrow the device's first session's table instead.  Same floats at the same positions, so the
+/// outputs are the same bytes.  Unset (default): every session builds its own table, exactly as before.
+bool qsa_rope_share_enabled();
+/// The table registered on the current device that covers `max_cells` positions (the state that built it), or null.
+/// session_bytes/session_init size and point a session's first QSA state at it; always null with the switch off.
+const QsaState* qsa_rope_shared(int64_t max_cells);
+/// Registers `owner`'s table (owner.owns_rope) for the current device when the switch is on and the device has no
+/// table covering as many positions yet.  The owner must outlive every borrower (sessions live as long as the process).
+void qsa_rope_share_register(const QsaState& owner, int64_t n_rot);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully

@@ -766,6 +766,48 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
 }
 }  // namespace
 
+// ---- kv-lean: one RoPE table per device (STRATA_ROPE_SHARE=1, layer.hpp).  The registry holds a copy of the owner
+// state's table pointers and length, per CUDA device; it is written while sessions are built (one host thread).
+namespace {
+constexpr int kRopeShareDevices = 64;
+QsaState g_rope_share[kRopeShareDevices];   // only cos_tab / sin_tab / max_cells are set
+int rope_share_device() {
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1;
+    }
+    return dev >= 0 && dev < kRopeShareDevices ? dev : -1;
+}
+}  // namespace
+bool qsa_rope_share_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_ROPE_SHARE");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+const QsaState* qsa_rope_shared(int64_t max_cells) {
+    if (!qsa_rope_share_enabled()) return nullptr;
+    const int dev = rope_share_device();
+    if (dev < 0) return nullptr;
+    const QsaState& r = g_rope_share[dev];
+    return r.cos_tab != nullptr && r.sin_tab != nullptr && r.max_cells >= max_cells ? &r : nullptr;
+}
+void qsa_rope_share_register(const QsaState& owner, int64_t n_rot) {
+    if (!qsa_rope_share_enabled() || !owner.owns_rope || owner.cos_tab == nullptr) return;
+    const int dev = rope_share_device();
+    if (dev < 0) return;
+    QsaState& r = g_rope_share[dev];
+    if (r.cos_tab != nullptr && r.max_cells >= owner.max_cells) return;
+    r.cos_tab = owner.cos_tab;
+    r.sin_tab = owner.sin_tab;
+    r.max_cells = owner.max_cells;
+    std::fprintf(stderr, "strata: STRATA_ROPE_SHARE=1: CUDA%d's RoPE table (%lld positions, %.1f MiB) is shared by the "
+                         "later sessions on it\n", dev, (long long) owner.max_cells,
+                 (double) owner.max_cells * (double) (n_rot / 2) * 8.0 / 1048576.0);
+}
+
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
