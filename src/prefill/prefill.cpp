@@ -3053,6 +3053,103 @@ struct KvaTap {
 };
 }  // namespace
 
+namespace {
+// STRATA_SELECT_TWO_PASS (PR #4119) in the layer-major walk too: STRATA_SELECT_TWO_PASS_LM=0 keeps that walk on the
+// 3xTF32 scorer (the chunked walk's two-pass calls stay); unset or anything else, the layer-major walk's selection
+// takes the two-pass scorer by the chunked walk's rule.  Read once.
+bool two_pass_lm_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SELECT_TWO_PASS_LM");
+        return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
+}
+}  // namespace
+
+#if !defined(STRATA_GPU_METAL)
+namespace {
+// STRATA_SELECT_TWO_PASS_CHECK=1 (a diagnostic), right after a two-pass call and its qsa_block_topk: today's scores and
+// ids for the same queries (qsa_block_scores_tc + qsa_block_topk) and the comparison, counted on the card and printed at
+// the prompt's end.  The reference buffers are the rest of `attn` past the two-pass scratch when it is large enough
+// (the attention writes `attn` after the comparison), else buffers of the card's own.  Upstream kept ONE static set of
+// those for the process (a one-GPU diagnostic); a layer split's stages read on threads of their own and on other cards,
+// so here each card has its own set, taken under a lock (one stage per card: a card's set is not in use twice at once).
+bool two_pass_check_batch(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps0, int64_t nb,
+                          int64_t sel_batch, int64_t max_blocks, int64_t cap, const strata::kernels::QsaShapes& s,
+                          const float* scores, const int32_t* ids, float* attn, uint64_t attn_bytes, cudaStream_t cs,
+                          int64_t active, std::string& err) {
+    const size_t want_sc = (size_t) sel_batch * (size_t) max_blocks, want_ids = (size_t) sel_batch * (size_t) cap;
+    const uint64_t at = (strata::kernels::qsa_two_pass_scratch_bytes(sel_batch, max_blocks) + 255u) & ~uint64_t(255u);
+    const uint64_t at_ids = at + (((uint64_t) want_sc * 4u + 255u) & ~uint64_t(255u));
+    float* ref_sc = nullptr;
+    int32_t* ref_ids = nullptr;
+    if (at_ids + (uint64_t) want_ids * 4u <= attn_bytes) {
+        ref_sc = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(attn) + at);
+        ref_ids = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(attn) + at_ids);
+    } else {
+        struct Own { float* sc = nullptr; int32_t* ids = nullptr; size_t sc_n = 0, ids_n = 0; };
+        static std::mutex mu;
+        static std::map<int, Own> own;   // by card; kept for the process (a diagnostic)
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); err = "STRATA_SELECT_TWO_PASS_CHECK: no card"; return false; }
+        const std::lock_guard<std::mutex> lk(mu);
+        Own& o = own[dev];
+        if (want_sc > o.sc_n || want_ids > o.ids_n) {
+            cudaStreamSynchronize(cs);
+            cudaFree(o.sc);
+            cudaFree(o.ids);
+            o = Own{};
+            if (cudaMalloc((void**) &o.sc, want_sc * 4) != cudaSuccess ||
+                cudaMalloc((void**) &o.ids, want_ids * 4) != cudaSuccess) {
+                (void) cudaGetLastError();
+                cudaFree(o.sc);
+                o = Own{};
+                err = "STRATA_SELECT_TWO_PASS_CHECK: no room for its buffers";
+                return false;
+            }
+            o.sc_n = want_sc;
+            o.ids_n = want_ids;
+        }
+        ref_sc = o.sc;
+        ref_ids = o.ids;
+    }
+    if (!strata::kernels::qsa_block_scores_tc(pooled, dead, q_idx, steps0, nb, max_blocks, s, ref_sc, cs, active)) {
+        err = "STRATA_SELECT_TWO_PASS_CHECK: the tensor-core scorer did not run";
+        return false;
+    }
+    strata::kernels::qsa_block_topk(ref_sc, steps0, nb, max_blocks, cap, s, ref_ids, cs, active);
+    strata::kernels::qsa_two_pass_check(scores, ids, ref_sc, ref_ids, steps0, nb, sel_batch, max_blocks, cap, attn, cs);
+    return true;
+}
+
+// STRATA_SELECT_TWO_PASS: what the two-pass scorer did on this card since the last report (its counters are read on
+// `cs`, synchronized, and zeroed), one line, and the check's line with STRATA_SELECT_TWO_PASS_CHECK=1.  `where`: the walk.
+void two_pass_report(cudaStream_t cs, const char* where) {
+    namespace tp = strata::kernels::two_pass;
+    unsigned long long c[tp::kStatCount] = {};
+    if (!strata::kernels::qsa_two_pass_stats(c, true, cs) || c[tp::kStCalls] == 0) return;
+    const unsigned long long sparse = c[tp::kStQueries], kept = sparse - c[tp::kStFull];
+    std::fprintf(stderr, "strata prefill: two-pass QSA select%s: %llu calls, %llu queries (%llu blocks) scored in single-pass "
+                         "TF32, %llu blocks scored again in 3xTF32 (%.1f per query, at most %llu), %llu queries "
+                         "flagged (%llu 16-query tiles scored again in full), %llu selecting every cell; candidates "
+                         "%.0f per query (at most %llu)\n",
+                 where, c[tp::kStCalls], sparse, c[tp::kStBlocks], c[tp::kStBand], kept ? (double) c[tp::kStBand] / kept : 0.0,
+                 c[tp::kStBandMax], c[tp::kStFull], c[tp::kStFullTiles], c[tp::kStIdentity],
+                 kept ? (double) c[tp::kStCand] / kept : 0.0, c[tp::kStCandMax]);
+    if (c[tp::kChkQueries] > 0) {
+        const uint32_t rb = (uint32_t) c[tp::kChkRatioMax];
+        float ratio = 0.0f;
+        std::memcpy(&ratio, &rb, 4);
+        std::fprintf(stderr, "strata prefill: two-pass check%s: %llu queries, %llu with ids not the 3xTF32 scorer's (%llu ids); "
+                             "scored again: %llu of %llu blocks not the 3xTF32 score bit for bit; kept: %llu of %llu "
+                             "single-pass scores outside the bound, the largest |S1 - S3| / bound %.4g\n",
+                     where, c[tp::kChkQueries], c[tp::kChkIdQueries], c[tp::kChkIdEntries], c[tp::kChkRescoredDiff],
+                     c[tp::kChkRescored], c[tp::kChkKeptOut], c[tp::kChkKept], (double) ratio);
+    }
+}
+}  // namespace
+#endif
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
     // force_chunk is for this run only: taken before any early return can leave it to the next one
@@ -4187,50 +4284,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs, active);
 #if !defined(STRATA_GPU_METAL)
-                        // STRATA_SELECT_TWO_PASS_CHECK=1 (diagnostic, one GPU): today's scores and ids for the same
-                        // queries, compared with the two-pass ones (counts at the prompt's end).  Their buffers are the
-                        // rest of m.attn past the two-pass scratch when it is large enough (the attention below writes
-                        // m.attn after the comparison), else buffers of their own
-                        if (tp_call && tp_check) {
-                            static float* own_sc = nullptr;
-                            static int32_t* own_ids = nullptr;
-                            static size_t own_sc_n = 0, own_ids_n = 0;
-                            const size_t want_sc = (size_t) m.sel_batch * (size_t) m.max_blocks, want_ids = (size_t) m.sel_batch * (size_t) m.cap;
-                            const uint64_t at = (strata::kernels::qsa_two_pass_scratch_bytes(m.sel_batch, m.max_blocks) + 255u) & ~uint64_t(255u);
-                            const uint64_t at_ids = at + (((uint64_t) want_sc * 4u + 255u) & ~uint64_t(255u));
-                            float* ref_sc = nullptr;
-                            int32_t* ref_ids = nullptr;
-                            if (at_ids + (uint64_t) want_ids * 4u <= tp_bytes) {
-                                ref_sc = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(m.attn) + at);
-                                ref_ids = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(m.attn) + at_ids);
-                            } else {
-                                if (want_sc > own_sc_n || want_ids > own_ids_n) {
-                                    cudaStreamSynchronize(m.cs);
-                                    cudaFree(own_sc);
-                                    cudaFree(own_ids);
-                                    own_sc = nullptr;
-                                    own_ids = nullptr;
-                                    own_sc_n = own_ids_n = 0;
-                                    if (cudaMalloc((void**) &own_sc, want_sc * 4) != cudaSuccess ||
-                                        cudaMalloc((void**) &own_ids, want_ids * 4) != cudaSuccess) {
-                                        err = "STRATA_SELECT_TWO_PASS_CHECK: no room for its buffers";
-                                        return false;
-                                    }
-                                    own_sc_n = want_sc;
-                                    own_ids_n = want_ids;
-                                }
-                                ref_sc = own_sc;
-                                ref_ids = own_ids;
-                            }
-                            if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
-                                                                      m.max_blocks, s, ref_sc, m.cs, active)) {
-                                err = "STRATA_SELECT_TWO_PASS_CHECK: the tensor-core scorer did not run";
-                                return false;
-                            }
-                            strata::kernels::qsa_block_topk(ref_sc, steps0, nb, m.max_blocks, m.cap, s, ref_ids, m.cs, active);
-                            strata::kernels::qsa_two_pass_check(m.sel_scores, m.sel_ids + t0 * m.cap, ref_sc, ref_ids, steps0, nb,
-                                                                m.sel_batch, m.max_blocks, m.cap, m.attn, m.cs);
-                        }
+                        // STRATA_SELECT_TWO_PASS_CHECK=1 (diagnostic): today's scores and ids for the same queries, compared
+                        // with the two-pass ones (counts at the prompt's end; buffers: two_pass_check_batch)
+                        if (tp_call && tp_check &&
+                            !two_pass_check_batch(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb, m.sel_batch,
+                                                  m.max_blocks, m.cap, s, m.sel_scores, m.sel_ids + t0 * m.cap, m.attn, tp_bytes,
+                                                  m.cs, active, err))
+                            return false;
 #endif
                     }
                     // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
@@ -6086,30 +6146,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }
     stats_.ms_total += ms_since(t_start);
 #if !defined(STRATA_GPU_METAL)
-    if (strata::kernels::qsa_two_pass_on()) {   // STRATA_SELECT_TWO_PASS: what the two-pass scorer did in this prompt
-        namespace tp = strata::kernels::two_pass;
-        unsigned long long c[tp::kStatCount] = {};
-        if (strata::kernels::qsa_two_pass_stats(c, true, m.cs) && c[tp::kStCalls] > 0) {
-            const unsigned long long sparse = c[tp::kStQueries], kept = sparse - c[tp::kStFull];
-            std::fprintf(stderr, "strata prefill: two-pass QSA select: %llu calls, %llu queries (%llu blocks) scored in single-pass "
-                                 "TF32, %llu blocks scored again in 3xTF32 (%.1f per query, at most %llu), %llu queries "
-                                 "flagged (%llu 16-query tiles scored again in full), %llu selecting every cell; candidates "
-                                 "%.0f per query (at most %llu)\n",
-                         c[tp::kStCalls], sparse, c[tp::kStBlocks], c[tp::kStBand], kept ? (double) c[tp::kStBand] / kept : 0.0,
-                         c[tp::kStBandMax], c[tp::kStFull], c[tp::kStFullTiles], c[tp::kStIdentity],
-                         kept ? (double) c[tp::kStCand] / kept : 0.0, c[tp::kStCandMax]);
-            if (c[tp::kChkQueries] > 0) {
-                const uint32_t rb = (uint32_t) c[tp::kChkRatioMax];
-                float ratio = 0.0f;
-                std::memcpy(&ratio, &rb, 4);
-                std::fprintf(stderr, "strata prefill: two-pass check: %llu queries, %llu with ids not the 3xTF32 scorer's (%llu ids); "
-                                     "scored again: %llu of %llu blocks not the 3xTF32 score bit for bit; kept: %llu of %llu "
-                                     "single-pass scores outside the bound, the largest |S1 - S3| / bound %.4g\n",
-                             c[tp::kChkQueries], c[tp::kChkIdQueries], c[tp::kChkIdEntries], c[tp::kChkRescoredDiff],
-                             c[tp::kChkRescored], c[tp::kChkKeptOut], c[tp::kChkKept], (double) ratio);
-            }
-        }
-    }
+    if (strata::kernels::qsa_two_pass_on()) two_pass_report(m.cs, "");   // STRATA_SELECT_TWO_PASS: what it did in this prompt
 #endif
     {
         static const bool f16_range = std::getenv("STRATA_F16_RANGE") != nullptr;
@@ -7381,19 +7418,48 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             }
                         } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                         pt.mark(kPfQsaSel, cs);
+#if !defined(STRATA_GPU_METAL)
+                        // STRATA_SELECT_TWO_PASS=1 here as in run_impl's chunked walk (the same rule, the same calls, so
+                        // qsa_block_topk returns the same cells): the scratch is m.attn (m.T rows, as there), which the
+                        // attention below writes on this stream and nothing reads before; the key norms are this layer's
+                        // and this sub-chunk's (its indexer appends above are complete).  STRATA_SELECT_TWO_PASS_LM=0: off
+                        static const bool tp_on = strata::kernels::qsa_two_pass_on() && two_pass_lm_on();
+                        static const bool tp_check = tp_on && strata::kernels::qsa_two_pass_check_on();
+                        static const int64_t tp_min = strata::kernels::qsa_two_pass_min_blocks();
+                        const uint64_t tp_bytes = (uint64_t) m.T * ZV * sizeof(float);
+                        const int64_t tp_nbid = T > 0 ? (int64_t) m.steps_host[(size_t) ((T - 1) * strata::kernels::kStepCount +
+                                                                                        strata::kernels::kStepNBid)] : 0;
+                        const bool tp_ok = tp_on && T <= m.T && tp_nbid + 1 >= tp_min &&
+                                           strata::kernels::qsa_two_pass_keys(st.idx_pooled, tp_nbid, m.sel_batch, m.max_blocks,
+                                                                              m.attn, tp_bytes, cs);
+#endif
                         for (int64_t q0 = 0; q0 < T; q0 += m.sel_batch) {
                             const int64_t nb = std::min(m.sel_batch, T - q0);
                             const int32_t* steps0 = m.steps_dev + q0 * strata::kernels::kStepCount;
                             const int64_t active = (int64_t) m.steps_host[(size_t) ((q0 + nb - 1) * strata::kernels::kStepCount +
                                                                                     strata::kernels::kStepNBid)] + 1;
                             static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
-                            if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
+                            bool tp_call = false;
+#if !defined(STRATA_GPU_METAL)
+                            tp_call = tp_ok && !old_sel && active >= tp_min &&
+                                      strata::kernels::qsa_block_scores_two_pass(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
+                                                                                 steps0, nb, m.sel_batch, m.max_blocks, s,
+                                                                                 m.sel_scores, m.attn, tp_bytes, cs, active);
+#endif
+                            if (!tp_call && (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
                                                                                  steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                                 cs, active))
+                                                                                 cs, active)))
                                 strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb,
                                                                   m.max_blocks, s, m.sel_scores, cs, active);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                             m.sel_ids + q0 * m.cap, cs, active);
+#if !defined(STRATA_GPU_METAL)
+                            if (tp_call && tp_check &&
+                                !two_pass_check_batch(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb, m.sel_batch,
+                                                      m.max_blocks, m.cap, s, m.sel_scores, m.sel_ids + q0 * m.cap, m.attn,
+                                                      tp_bytes, cs, active, err))
+                                return false;
+#endif
                         }
                         const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                            : core::qsa_attn_pools(st);
@@ -7494,6 +7560,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         return false;
     }
     stats_.ms_total += ms_since(t_start);
+#if !defined(STRATA_GPU_METAL)
+    if (strata::kernels::qsa_two_pass_on() && two_pass_lm_on()) two_pass_report(cs, " (layer-major)");
+#endif
     std::fprintf(stderr, "strata prefill: layer-major (layers %lld..%lld): %lld tokens in %lld super-chunk(s) of up to %lld (R in %s, %lld MiB VRAM free before), "
                          "%lld expert blobs streamed (%.1f MB), %lld resident, %lld expert groups (%lld on the FP16 path); %.0f ms (host: "
                          "enqueueing the attention halves %.0f, the experts %.0f: waiting for the attention halves "
@@ -7595,9 +7664,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         }
         if (lm_prepare_chain(n, why) > 0) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
-            // STRATA_SELECT_TWO_PASS is in run_impl's selection only, not in this walk: say so once
+            // STRATA_SELECT_TWO_PASS runs in this walk too, unless STRATA_SELECT_TWO_PASS_LM=0 keeps it out: say so once
             static strata::kernels::two_pass::RequestStatus tp_status(std::getenv("STRATA_SELECT_TWO_PASS"));
-            (void) tp_status.on("the layer-major prompt path");
+            if (!two_pass_lm_on()) (void) tp_status.on("the layer-major prompt path (STRATA_SELECT_TWO_PASS_LM=0)");
 #endif
             bool ok = run_layer_major(tokens, n, pos0, err);
             std::string drain_err;   // a layer split: the later stages' last super-chunk

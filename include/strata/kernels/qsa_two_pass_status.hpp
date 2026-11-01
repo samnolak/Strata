@@ -4,6 +4,7 @@
 // tensor-core kernel (sm_80+, STRATA_QSA_WARP not set).  Elsewhere (HIP, Metal, SYCL, an older card or the warp
 // scorer, the layer-major prompt path) the selection runs as without the switch; that was silent, so the switch read
 // as active.  Header-only, so the rule and the line are tested without a GPU (qsa_two_pass_status_test).
+// (This fork: the layer-major walk takes the scorer too; only STRATA_SELECT_TWO_PASS_LM=0 makes it say so there.)
 #include <atomic>
 #include <cstdio>
 

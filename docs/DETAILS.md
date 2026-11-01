@@ -1080,8 +1080,10 @@ On an RTX 3090 (sm_86, PCIe 3.0, 250 W; the v0.2.6 release defaults, 2 pairs of 
 change. Calls whose last query has `STRATA_SELECT_TWO_PASS_MIN` blocks or more take it (default 4096, 16K cells).
 `STRATA_SELECT_TWO_PASS_CHECK=1` (a slow diagnostic) runs the 3xTF32 scorer beside it and prints, after each prompt, the
 queries whose ids differ (must be 0). Where the scorer cannot run (HIP, Metal and SYCL builds, a card below sm_80 or
-`STRATA_QSA_WARP`, the layer-major prompt path) a set switch prints one line saying it is not used there, and the
-selection is unchanged.
+`STRATA_QSA_WARP`) a set switch prints one line saying it is not used there, and the selection is unchanged. The
+layer-major prompt path (the default on a CUDA layer split) takes it by the same rule (this fork; upstream PR #4119 had it
+in the chunked walk only); `STRATA_SELECT_TWO_PASS_LM=0` keeps that path on the 3xTF32 scorer. The check's own buffers
+are one set per card, so `STRATA_SELECT_TWO_PASS_CHECK=1` works on a layer split.
 
 ### RTX 20 (Turing, sm_75) kernels (opt-in)
 
