@@ -101,10 +101,17 @@ out comes from the SSD.
   `vec_dot_q6_K_q8_1` behind `Fmt<14>`). Per-token MMVQ (`native_mmvq`) has Q6_K too.
 - Prompt path: llama.cpp's MMQ prompt kernels instantiate Q6_K in the K-quant library (`STRATA_MMQ_KQ=1`). Without it
   the prompt takes the FP16 path.
+- CPU experts (opt-in `STRATA_CPU_AVX2_MT=1`, AVX2 CPUs with the AVX2 ggml-cpu build): multi-token AVX-2 rows for Q6_K
+  gate/up and Q8_0 gate/up/down (`kq_mt_avx2.cpp`, the loop structure of ik_llama.cpp's multi-column GEMM with ggml's
+  arithmetic), bit-exact against ggml-cpu's per-token dot at any group size; checked once against the linked ggml before
+  first use. One Zen 3 thread (EPYC 7Y43, `kq_mt_avx2_parity --bench`): Q6_K gate/up 1.0x at 1 token, 1.5x at 2, 1.9x
+  from 4; Q8_0 down 1.1x / 1.5x / 1.8x. Bound by DRAM at 1-2 tokens with many threads, so it pays from ~4 tokens per
+  expert group (batched verify, prefill). `STRATA_CPU_AVX2_MT_MIN=N` (default 1) sets the smallest group it takes.
 - Tests: `native_grouped_parity` loops Q6_K/Q8_0 pairs, `prefill_mmq_kquant_test` runs Q6_K gate/up products at
   1280x2560 against a double-precision reference, and `native_expert_parity --synthetic q6_K/q8_0` checks GPU and CPU
   against ggml's dequantized weights. `ple_reader_test --selftest` runs 90, 110 and 170-byte PLE rows, and
-  `ple_q8_parity` matches ggml's reference dequantizer bit for bit through both Mmap and Direct.
+  `ple_q8_parity` matches ggml's reference dequantizer bit for bit through both Mmap and Direct. `kq_mt_avx2_parity`
+  checks the `STRATA_CPU_AVX2_MT` rows bit for bit against ggml's dot at 1..16 tokens and through the engine's entry points.
 - Not measured on this page: quality against llama.cpp on this file ([QUANTS.md](QUANTS.md) has the Unsloth quality
   comparison).
 

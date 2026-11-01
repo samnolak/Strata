@@ -7,6 +7,7 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
+#include "strata/kernels/cpu/kq_mt_avx2.hpp"
 #include "strata/kernels/cpu/nvfp4_avx2.hpp"
 #include "strata/kernels/cpu/nvfp4_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -150,6 +151,82 @@ bool x512_one_ok(int type) {
 void init_once() {
     static std::once_flag once;
     std::call_once(once, [] { ggml_cpu_init(); });
+}
+
+// STRATA_CPU_AVX2_MT=1 (opt-in, default off = the per-token ggml path, byte for byte): the multi-token AVX-2 rows of
+// kq_mt_avx2.cpp for Q6_K gate/up and Q8_0 gate/up/down (Unsloth UD-Q6_K_XL).  They are ggml-cpu's AVX2 single-token
+// dot for every token (same integer lanes, same float operations in the same order), so they need ggml-cpu itself
+// built for AVX2 + FMA and not AVX-512 (the STRATA_PORTABLE build), and the first use of each type checks the bits
+// against the linked ggml on synthetic blocks (any mismatch: the ggml path stays, with a note).  From
+// STRATA_CPU_AVX2_MT_MIN tokens on (default 1: as exact as ggml's dot at one token, and no slower).
+bool avx2_mt_reference_ok(int type) {
+    static std::mutex mu;
+    static std::map<int, bool> memo;
+    std::lock_guard<std::mutex> lk(mu);
+    if (const auto it = memo.find(type); it != memo.end()) return it->second;
+    bool ok = false;
+    const ggml_type_traits_cpu* tr = traits(type);
+    const ggml_type_traits_cpu* ta = tr != nullptr ? traits(tr->vec_dot_type) : nullptr;
+    if (tr != nullptr && tr->vec_dot != nullptr && ta != nullptr && ta->from_float != nullptr) {
+        ok = true;
+        uint32_t seed = 6061u + (uint32_t) type;
+        auto rnd = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+        for (const int n : {512, 2560}) {
+            constexpr int rows = 16, nt = 3;
+            const size_t rb = ggml_row_size((ggml_type) type, n);
+            const int bk = (int) ggml_blck_size((ggml_type) type);
+            const size_t nb = (size_t) n / (size_t) bk, bb = rb / nb;
+            std::vector<uint8_t> w((size_t) rows * rb);
+            for (auto& b : w) b = (uint8_t) rnd();
+            for (int r = 0; r < rows; ++r)
+                for (size_t k = 0; k < nb; ++k) {   // a finite fp16 scale ~0.1 per block (Q6_K: at its end, Q8_0: first)
+                    uint8_t* d = &w[(size_t) r * rb + k * bb + (type == 14 ? bb - 2 : 0)];
+                    d[0] = (uint8_t) (0x60 + (rnd() & 0xf)); d[1] = 0x2e;
+                }
+            std::vector<std::vector<uint8_t>> act((size_t) nt, std::vector<uint8_t>(ggml_row_size(tr->vec_dot_type, n)));
+            std::vector<float> x((size_t) n);
+            const void* ap[nt];
+            for (int t = 0; t < nt; ++t) {
+                for (auto& v : x) v = ((float) (rnd() % 2001) - 1000.f) * 0.001f;
+                ta->from_float(x.data(), act[(size_t) t].data(), n);
+                ap[t] = act[(size_t) t].data();
+            }
+            std::vector<float> got((size_t) nt * rows), want((size_t) nt * rows);
+            float* op[nt];
+            for (int t = 0; t < nt; ++t) op[t] = got.data() + (size_t) t * rows;
+            kqmt_rows(type, w.data(), rb, n, ap, nt, op, 0, rows);
+            for (int t = 0; t < nt; ++t)
+                for (int r = 0; r < rows; ++r) tr->vec_dot(n, &want[(size_t) t * rows + r], 0, w.data() + (size_t) r * rb, 0, ap[t], 0, 1);
+            if (std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) != 0) {
+                std::fprintf(stderr, "strata: STRATA_CPU_AVX2_MT: the multi-token AVX-2 rows of type %d differ from this ggml-cpu's dot (n=%d): not used\n", type, n);
+                ok = false;
+                break;
+            }
+        }
+    }
+    memo[type] = ok;
+    return ok;
+}
+
+bool avx2_mt_on(int type) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_CPU_AVX2_MT");
+        const bool want = v != nullptr && v[0] == '1' && v[1] == 0;
+        const bool can = cpu_avx2_ok() && ggml_cpu_has_avx2() && ggml_cpu_has_fma() && !ggml_cpu_has_avx512();
+        if (want) std::fprintf(stderr, "strata: STRATA_CPU_AVX2_MT=1: %s\n", can ? "multi-token AVX-2 rows for Q6_K / Q8_0 experts (bit-exact vs ggml's dot)"
+                                                                              : "needs an AVX2 CPU and ggml-cpu built for AVX2+FMA without AVX-512: off");
+        return want && can;
+    }();
+    if (!on) return false;
+    // checked once per type, then a plain static read (no lock on the pool's hot path)
+    if (type == 14) { static const bool ok = avx2_mt_reference_ok(14); return ok; }
+    if (type == 8) { static const bool ok = avx2_mt_reference_ok(8); return ok; }
+    return false;
+}
+
+int avx2_mt_min() {
+    static const int m = [] { const char* e = std::getenv("STRATA_CPU_AVX2_MT_MIN"); return e ? std::max(1, std::atoi(e)) : 1; }();
+    return m;
 }
 
 }  // namespace
@@ -427,6 +504,11 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         }
         return;
     }
+    // STRATA_CPU_AVX2_MT=1: Q6_K / Q8_0 gate/up on the multi-token AVX-2 rows (ggml's bits for every token, any group)
+    if (f.tail_off == 0 && nt >= avx2_mt_min() && kqmt_supported(f.gu_type) && avx2_mt_on(f.gu_type)) {
+        kqmt_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     const int mt_min = native_gu_mt_min(f.gu_type);   // #152
     const bool singleton_iq = Arithmetic == NativeArithmetic::WindowInvariant && mt_min > 1;
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
@@ -526,6 +608,11 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
     if (tq_rows_own(f.d_type)) {   // the trellis types, as in native_gu_rows
         tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    // STRATA_CPU_AVX2_MT=1: Q8_0 (and Q6_K) down on the multi-token AVX-2 rows, as the gate/up rows above
+    if (f.tail_off == 0 && nt >= avx2_mt_min() && kqmt_supported(f.d_type) && avx2_mt_on(f.d_type)) {
+        kqmt_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8) &&
