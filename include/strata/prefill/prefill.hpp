@@ -263,6 +263,19 @@ public:
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
+    /// STRATA_BATCH_CPU_SHARE: while one of these lives no chunk takes the CPU pool for its share - a prompt read on a
+    /// thread of its own beside decoding batch slots (STRATA_PIPED_CONCURRENT, STRATA_BATCH_CONCURRENT_READ), whose
+    /// windows run their CPU experts on the same pool meanwhile.  They nest; none (the default) changes nothing.
+    struct CpuShareSuspend {
+        CpuShareSuspend();
+        ~CpuShareSuspend();
+        CpuShareSuspend(const CpuShareSuspend&) = delete;
+        CpuShareSuspend& operator=(const CpuShareSuspend&) = delete;
+    };
+    static bool cpu_share_suspended();
+    /// The most tokens of a chunk an expert may have and still go to the CPU share (STRATA_PREFILL_CPU_SHARE_TOKENS,
+    /// default kernels::cpu::MAXT); for the engine's log line.
+    static int cpu_share_token_cap();
 
     /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
     /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.

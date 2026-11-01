@@ -268,6 +268,23 @@ inline int64_t cpu_share_max() {
 // On a layer split every stage may have the pool (set_cpu_pool), and the stages read different chunks at the same time:
 // one stage at a time takes it for a chunk, the other reads its chunk with the GPU alone.
 std::atomic<bool> g_cpu_pool_busy{false};
+// STRATA_BATCH_CPU_SHARE (generate.cpp): a prompt read on a thread of its own beside decoding batch slots
+// (STRATA_PIPED_CONCURRENT, STRATA_BATCH_CONCURRENT_READ) leaves the pool to the slots' windows, which run their CPU experts
+// on it meanwhile, so no chunk takes it then: Prefill::CpuShareSuspend counts such reads (0, the default: as before).
+std::atomic<int> g_cpu_share_suspend{0};
+// STRATA_PREFILL_CPU_SHARE_TOKENS=N (opt-in; unset: kernels::cpu::MAXT, as before): an expert routed by up to N of a chunk's
+// tokens can go to the CPU share.  The pool's multi-token job holds MAXT tokens, so an expert with more runs as
+// ceil(n / MAXT) jobs on the same blob - each reads the expert's rows again, from RAM - which pays where the host's RAM
+// is much faster than the card's link and a chunk of ~500-1500 tokens gives most of its streamed experts 9-30 tokens
+// (512 experts, top-10).  The share's measured split (`auto`) then prices those experts as they are.
+inline int cpu_share_tokens() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE_TOKENS");
+        const int d = strata::kernels::cpu::MAXT;
+        return e != nullptr && std::atoi(e) > 0 ? std::clamp(std::atoi(e), 1, 512) : d;
+    }();
+    return v;
+}
 double g_pinned_share = 1.0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
@@ -2630,6 +2647,10 @@ int64_t Prefill::ring_max_slots() {
 
 int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
+Prefill::CpuShareSuspend::CpuShareSuspend() { g_cpu_share_suspend.fetch_add(1, std::memory_order_acq_rel); }
+Prefill::CpuShareSuspend::~CpuShareSuspend() { g_cpu_share_suspend.fetch_sub(1, std::memory_order_acq_rel); }
+bool Prefill::cpu_share_suspended() { return g_cpu_share_suspend.load(std::memory_order_acquire) != 0; }
+int Prefill::cpu_share_token_cap() { return cpu_share_tokens(); }
 void Prefill::arm_cpu_share(bool applies, bool by_default) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
@@ -3344,7 +3365,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             bool held = false;
             ~PoolHold() { if (held) g_cpu_pool_busy.store(false, std::memory_order_release); }
         } pool_hold;
-        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all && !pipe_chunked) {
+        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all && !pipe_chunked &&
+            g_cpu_share_suspend.load(std::memory_order_acquire) == 0) {
             bool expect = false;
             pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
         }
@@ -4406,7 +4428,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         if (on_routes) on_routes(l, ids_h, T * K);   // 149-prefetch: the RAM policy's prompt seed
                         if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
-                            const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
+                            const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) cpu_share_tokens() * m.g->n_expert) * N;
                             if (m.cpu_rows_n < cap) {
                                 if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
                                 m.cpu_rows = nullptr;
@@ -4480,7 +4502,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 ++nstream;
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
                                 // short-lived buffer (the arena's unpinned part, the mapped experts.bin's pages)
-                                if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
+                                if (c <= cpu_share_tokens() && (m.src->pinned(l, e) || !m.src->transient(l, e)))
                                     cand.emplace_back(c, e);
                             }
                             std::sort(cand.begin(), cand.end());
@@ -4657,16 +4679,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.cpu_jobs.clear();
                                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                     if (!on_cpu[(size_t) e]) continue;
-                                    strata::kernels::cpu::ExpertJobMulti j;
-                                    j.blob = cpu_blob[(size_t) e];
-                                    j.nt = m.cnt[(size_t) e];
-                                    for (int r = 0; r < j.nt; ++r) {
-                                        const int64_t p = (int64_t) m.off[(size_t) e] + r;
-                                        if (q2) j.act[r] = &m.cpu_actq[(size_t) src_h[(size_t) p]];
-                                        else j.nact[r] = m.cpu_nact.data() + (size_t) src_h[(size_t) p] * AB;
-                                        j.out[r] = m.cpu_rows + (size_t) (p - r0c) * N;
+                                    // at most MAXT tokens a job: an expert with more (STRATA_PREFILL_CPU_SHARE_TOKENS)
+                                    // runs as several jobs on its blob, its rows in the same order
+                                    const int32_t ne = m.cnt[(size_t) e];
+                                    for (int32_t r0 = 0; r0 < ne; r0 += strata::kernels::cpu::MAXT) {
+                                        strata::kernels::cpu::ExpertJobMulti j;
+                                        j.blob = cpu_blob[(size_t) e];
+                                        j.nt = std::min<int32_t>(strata::kernels::cpu::MAXT, ne - r0);
+                                        for (int r = 0; r < j.nt; ++r) {
+                                            const int64_t p = (int64_t) m.off[(size_t) e] + r0 + r;
+                                            if (q2) j.act[r] = &m.cpu_actq[(size_t) src_h[(size_t) p]];
+                                            else j.nact[r] = m.cpu_nact.data() + (size_t) src_h[(size_t) p] * AB;
+                                            j.out[r] = m.cpu_rows + (size_t) (p - r0c) * N;
+                                        }
+                                        m.cpu_jobs.push_back(j);
                                     }
-                                    m.cpu_jobs.push_back(j);
                                 }
                                 cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
                                 cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
