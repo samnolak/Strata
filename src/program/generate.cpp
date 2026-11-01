@@ -751,6 +751,14 @@ struct Options {
     /// `--vram-reserve-later-mib N`: the reserve on a layer split's later cards (default: the same as the first).
     /// A card that drives no display needs less than the one the monitors are on.
     int vram_reserve_later_mib = -1;
+    /// p55/final2-c (opt-in): `--vram-reserve-per-dev m0,m1,..` (or STRATA_VRAM_RESERVE_PER_DEV): the base reserve of each
+    /// CUDA device in the engine's order, -1 = not given (that device keeps the two flags above).  Empty = not used.
+    std::vector<int64_t> vram_reserve_per_dev;
+    std::string vram_reserve_per_dev_arg;   ///< the list as given on the command line ("" = read the environment)
+    /// --vram-reserve-mib as the flag (or the default) gave it before the primary card's item replaced it, -1 = not
+    /// replaced (then vram_reserve_mib still is it): the fallback of a later device the list gives no item
+    /// (stage_reserve::device_reserve / flag_reserve)
+    int64_t vram_reserve_flag_mib = -1;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  A chunk of
@@ -1047,6 +1055,10 @@ void usage() {
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
+                 "  --vram-reserve-per-dev M0,M1,..  the VRAM reserve of each CUDA device in this process's order\n"
+                 "                       (CUDA_VISIBLE_DEVICES), e.g. 3584,2816,2816,6656 for a display on CUDA3; an\n"
+                 "                       empty item or - keeps --vram-reserve-mib / --vram-reserve-later-mib there (also\n"
+                 "                       STRATA_VRAM_RESERVE_PER_DEV; the flag wins; default: not used)\n"
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
@@ -3242,6 +3254,10 @@ int main(int argc, char** argv) {
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--vram-reserve-later-mib")
             o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
+        else if (a == "--vram-reserve-per-dev") {
+            o.vram_reserve_per_dev_arg = next("--vram-reserve-per-dev");
+            if (o.vram_reserve_per_dev_arg.empty()) { std::fprintf(stderr, "--vram-reserve-per-dev needs a list\n"); return 2; }
+        }
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto" || v.rfind("auto:", 0) == 0;
@@ -3835,6 +3851,59 @@ int main(int argc, char** argv) {
         for (const int d : split_devs) devs += (devs.empty() ? "" : ",") + std::to_string(d);
         std::fprintf(stderr, "strata generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
                      split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
+    }
+    // p55/final2-c (opt-in): a base VRAM reserve per CUDA device (stage_reserve::base_reserve_for).  The primary card's
+    // value becomes --vram-reserve-mib (an explicit one: #496 / the WDDM floor leave it alone), so every place that
+    // sizes the first card's cache follows it; a later stage's value is read where its room is (stage_room, the serve
+    // check).  Not given: nothing here runs and every reserve is the one the two flags give, as before.
+    {
+        const char* env_pd = std::getenv("STRATA_VRAM_RESERVE_PER_DEV");
+        const bool from_arg = !o.vram_reserve_per_dev_arg.empty();
+        const std::string list = from_arg ? o.vram_reserve_per_dev_arg : (env_pd != nullptr ? std::string(env_pd) : std::string());
+        if (!list.empty()) {
+            std::string perr;
+            if (!strata::program::stage_reserve::parse_per_dev(list, o.vram_reserve_per_dev, perr)) {
+                std::fprintf(stderr, "strata generate: %s: %s (expected MiB per CUDA device, e.g. \"3584,2816,2816,6656\"; "
+                                     "an empty item or - keeps that device's reserve)\n",
+                             from_arg ? "--vram-reserve-per-dev" : "STRATA_VRAM_RESERVE_PER_DEV", perr.c_str());
+                return 2;
+            }
+            const int vram_reserve_flag = o.vram_reserve_mib;   // as the flag (or the default) left it, for the log
+            // the primary card's item replaces --vram-reserve-mib; the flag's value is kept for the later devices
+            o.vram_reserve_flag_mib = strata::program::stage_reserve::apply_primary(o.vram_reserve_per_dev, primary_device,
+                                                                                   o.vram_reserve_mib, o.vram_reserve_given);
+            int n_vis = 1;
+            if (cudaGetDeviceCount(&n_vis) != cudaSuccess || n_vis < 1) n_vis = 1;
+            (void) cudaGetLastError();
+            std::vector<int> used{primary_device};
+            if (multi_gpu) used.insert(used.end(), split_devs.begin(), split_devs.end());
+            std::string line;
+            for (size_t i = 0; i < used.size(); ++i) {
+                const int d = used[i];
+                const bool later = i > 0;
+                const int64_t mine = strata::program::stage_reserve::per_dev_value(o.vram_reserve_per_dev, d);
+                const int64_t r = strata::program::stage_reserve::device_reserve(   // what stage_room / the serve check use
+                    d, later, primary_device, o.vram_reserve_mib, o.vram_reserve_flag_mib, o.vram_reserve_later_mib,
+                    o.vram_reserve_per_dev);
+                line += (line.empty() ? "" : ", ") + std::string("CUDA") + std::to_string(d) + " " + std::to_string((long long) r) +
+                        " MiB" + (mine >= 0 ? "" : later && o.vram_reserve_later_mib >= 0 ? " (--vram-reserve-later-mib)"
+                                                                                            : " (--vram-reserve-mib)");
+            }
+            std::string unused;
+            for (size_t d = 0; d < o.vram_reserve_per_dev.size(); ++d)
+                if (o.vram_reserve_per_dev[d] >= 0 && std::find(used.begin(), used.end(), (int) d) == used.end())
+                    unused += (unused.empty() ? "" : ",") + std::to_string(d);
+            std::fprintf(stderr, "strata generate: VRAM reserve per device (%s \"%s\"): %s; was --vram-reserve-mib %d, "
+                                 "--vram-reserve-later-mib %s%s%s\n",
+                         from_arg ? "--vram-reserve-per-dev" : "STRATA_VRAM_RESERVE_PER_DEV", list.c_str(), line.c_str(),
+                         vram_reserve_flag,
+                         o.vram_reserve_later_mib >= 0 ? std::to_string(o.vram_reserve_later_mib).c_str() : "(same)",
+                         unused.empty() ? "" : "; ignored for CUDA", unused.empty() ? "" : (unused + " (no stage runs there)").c_str());
+            if (o.vram_reserve_per_dev.size() > (size_t) n_vis)
+                std::fprintf(stderr, "strata generate: STRATA_VRAM_RESERVE_PER_DEV / --vram-reserve-per-dev: %zu items, %d CUDA "
+                                     "devices visible (the order is CUDA_VISIBLE_DEVICES')\n",
+                             o.vram_reserve_per_dev.size(), n_vis);
+        }
     }
 #if defined(STRATA_USE_HIP)
     {
@@ -5459,8 +5528,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
         const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
-        const int64_t base_reserve =
-            later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
+        // p55/final2-c: the device's own value when --vram-reserve-per-dev / STRATA_VRAM_RESERVE_PER_DEV gives one (dev -1 =
+        // the primary card, whose item is o.vram_reserve_mib already); a later device without one falls back to the
+        // flag's own --vram-reserve-mib (o.vram_reserve_flag_mib), not the primary's item; unset list = the old expression
+        const int64_t base_reserve = strata::program::stage_reserve::device_reserve(
+            dev, later, primary_device, o.vram_reserve_mib, o.vram_reserve_flag_mib, o.vram_reserve_later_mib,
+            o.vram_reserve_per_dev);
         strata::program::stage_reserve::Inputs rin;
         rin.base_reserve_mib = base_reserve;
         rin.prompt_buffers_mib = pf;
@@ -12750,9 +12823,15 @@ int main(int argc, char** argv) {
                                      "cache fits): requests may stall. Close other programs that use the GPU, or lower "
                                      "--max-context\n", (long long) free_mib, o.vram_reserve_mib);
             } else {
+                // p55/final2-c: with a per-device list the first card's item is the knob (--vram-reserve-mib is overridden)
+                const long long want0 = (long long) (o.vram_reserve_mib + 512 - free_mib);
+                const std::string hint0 =
+                    strata::program::stage_reserve::per_dev_value(o.vram_reserve_per_dev, primary_device) >= 0
+                        ? "set CUDA" + std::to_string(primary_device) + "'s item of STRATA_VRAM_RESERVE_PER_DEV to " + std::to_string(want0)
+                        : "add --vram-reserve-mib " + std::to_string(want0) + " to the config's args";
                 std::fprintf(stderr, "strata serve: %lld MiB of VRAM free with everything loaded - LOW: requests may stall;"
-                                     " add --vram-reserve-mib %lld to the config's args (or lower --max-context)\n",
-                             (long long) free_mib, (long long) (o.vram_reserve_mib + 512 - free_mib));
+                                     " %s (or lower --max-context)\n",
+                             (long long) free_mib, hint0.c_str());
                 // #781 / #831: an explicit --expert-cache N is a byte budget that is not checked against the VRAM once
                 // the slots are written (auto is), so on a card it fills a smaller N is the cure: a few hundred slots
                 // can be the difference between 14 and 100 tok/s under WDDM.  Said, never changed.
@@ -12771,21 +12850,28 @@ int main(int argc, char** argv) {
                 size_t sf = 0, stot = 0;
                 if (cudaMemGetInfo(&sf, &stot) != cudaSuccess) { (void) cudaGetLastError(); continue; }
                 const int64_t sf_mib = (int64_t) (sf >> 20);
-                const int later_reserve = o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
+                const int later_reserve = (int) strata::program::stage_reserve::device_reserve(   // p55/final2-c
+                    stp->dev, true, primary_device, o.vram_reserve_mib, o.vram_reserve_flag_mib, o.vram_reserve_later_mib,
+                    o.vram_reserve_per_dev);
                 if (sf_mib >= 512)
                     std::fprintf(stderr, "strata serve: CUDA%d: %lld MiB of VRAM free with everything loaded\n", stp->dev,
                                  (long long) sf_mib);
-                else
+                else {
+                    const long long want = (long long) (later_reserve + 768 - sf_mib);
+                    const std::string hint =   // p55/final2-c: the device's item when the per-device list gives one
+                        strata::program::stage_reserve::per_dev_value(o.vram_reserve_per_dev, stp->dev) >= 0
+                            ? "set CUDA" + std::to_string(stp->dev) + "'s item of STRATA_VRAM_RESERVE_PER_DEV to " + std::to_string(want)
+                            : "add --vram-reserve-later-mib " + std::to_string(want) + " to the config's args";
                     std::fprintf(stderr, "strata serve: CUDA%d: %lld MiB of VRAM free with everything loaded - LOW: its window "
-                                         "graphs are captured on first use and need room too, and %s; add "
-                                         "--vram-reserve-later-mib %lld to the config's args (or lower --max-context)\n",
+                                         "graphs are captured on first use and need room too, and %s; %s (or lower --max-context)\n",
                                  stp->dev, (long long) sf_mib,
 #ifdef _WIN32
                                  "under WDDM a full card pages instead of failing, which can stall a request for good (#2192)",
 #else
                                  "a full card can stall a request",
 #endif
-                                 (long long) (later_reserve + 768 - sf_mib));
+                                 hint.c_str());
+                }
                 if (sf_mib < 512) {   // #3702: how far the plan was off, so the reserve to ask for is not a guess
                     strata::program::stage_reserve::Inputs rin;
                     rin.base_reserve_mib = later_reserve;
@@ -14774,12 +14860,18 @@ int main(int argc, char** argv) {
                     static int64_t low_said_at = INT64_MAX;
                     if (vf < kVramSafeMib && vf + 128 <= low_said_at) {
                         low_said_at = vf;
+                        const long long want = (long long) ((o.vram_reserve_mib + (kVramSafeMib - vf) + 63) / 64 * 64);
+                        // p55/final2-c: with a per-device list the first card's item is the knob
+                        const std::string hint =
+                            strata::program::stage_reserve::per_dev_value(o.vram_reserve_per_dev, primary_device) >= 0
+                                ? "Set CUDA" + std::to_string(primary_device) + "'s item of STRATA_VRAM_RESERVE_PER_DEV to " + std::to_string(want)
+                                : "Add --vram-reserve-mib " + std::to_string(want) + " to the config's args";
                         std::fprintf(stderr, "strata serve: WARNING: only %lld MiB of VRAM free at the start of this request "
                                              "(below %lld MiB): when the card is this full the driver can page GPU memory "
                                              "to system RAM, decode falls to a few tok/s and a window may never finish "
-                                             "(#2065). Add --vram-reserve-mib %lld to the config's args, or lower "
+                                             "(#2065). %s, or lower "
                                              "--max-context / --batch\n", (long long) vf, (long long) kVramSafeMib,
-                                     (long long) ((o.vram_reserve_mib + (kVramSafeMib - vf) + 63) / 64 * 64));
+                                     hint.c_str());
                     }
                 }
             }
