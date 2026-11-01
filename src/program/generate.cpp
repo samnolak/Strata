@@ -90,6 +90,7 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/idle_park.hpp"
+#include "strata/core/capture_abort.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/program/stage_reserve.hpp"
 #include "strata/program/gpu_report.hpp"
@@ -11026,15 +11027,27 @@ int main(int argc, char** argv) {
             });
         };
         pool_topup();   // the first request's checkpoints find the pool full
+        // STRATA_IDLE_PARK: the free RAM an idle park leaves above --conversation-cache-min-free-mib, and whether the last
+        // idle park stopped because a request came in (park_source sets it; idle_park_one reads and clears it)
+        static const int64_t idle_park_free_mib =
+            strata::program::idle_park::free_mib_from(std::getenv("STRATA_IDLE_PARK_FREE_MIB"));
+        bool idle_park_aborted = false;
         auto park_source = [&](const ParkSource& src, size_t held) -> bool {
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
             // sees a park that moves and ends one that does not.
+            // STRATA_IDLE_PARK: an idle park (src.no_evict) is not a request's stage - it says so, and gives back the stage it
+            // ran in (idle, or between batch windows) instead of "request"
             struct ParkStage {
-                ParkStage() { strata::core::progress_at("request: parking the previous conversation"); }
-                ~ParkStage() { strata::core::progress_at("request"); strata::core::progress_beat(); }
-            } park_stage;
+                bool idle;
+                const char* prev;
+                explicit ParkStage(bool i) : idle(i), prev(strata::core::progress().where.load()) {
+                    strata::core::progress_at(idle ? "idle: parking an idle batch slot's conversation (STRATA_IDLE_PARK)"
+                                                   : "request: parking the previous conversation");
+                }
+                ~ParkStage() { strata::core::progress_at(idle ? prev : "request"); strata::core::progress_beat(); }
+            } park_stage{src.no_evict};
             // --conversation-cache-min-tokens: a short conversation is not worth one of the slots.  Parking is a
             // switch-time decision, so a client's small side requests would otherwise park themselves and, once the
             // cache is full, evict the long conversation they were interleaved with (oldest first) - the reuse it
@@ -11046,8 +11059,10 @@ int main(int argc, char** argv) {
                 return true;
             }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
-            // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
+            // nothing the outgoing chain does not, apart from the tail this conversation rewrote).  STRATA_IDLE_PARK: not
+            // for an idle park - it may still be skipped (no room without an eviction, the RAM floor, a request coming in),
+            // and the copies must stay then; put() drops them when the image is stored
+            if (const size_t dropped = src.no_evict ? 0 : conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
@@ -11124,7 +11139,9 @@ int main(int argc, char** argv) {
             // estimate must stay uncapped: it counts the retained buffers'
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
-            if (src.no_evict && !conversations.can_fit(estimate, held)) {   // STRATA_IDLE_PARK: never at another's expense
+            // STRATA_IDLE_PARK: never at another's expense - it fits beside what stays parked once put() has dropped the
+            // copies it supersedes (the image's checkpoints are the view's), or nothing is touched
+            if (src.no_evict && !conversations.can_fit_superseding(estimate, held, src.ids, src.imgs, view.checkpoints, src.cvec)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking%s (%zu MiB do not fit beside the %zu parked "
                                      "without an eviction)\n", src.what.c_str(), estimate >> 20, conversations.size());
                 return true;
@@ -11136,7 +11153,10 @@ int main(int argc, char** argv) {
             }
             const auto t0 = Clock::now();
             try {
-                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                // STRATA_IDLE_PARK: an idle park leaves STRATA_IDLE_PARK_FREE_MIB more free than the floor (its copy may be
+                // one nobody restores: the agent comes back to its slot)
+                const uint64_t floor = ((uint64_t) o.conversation_cache_min_free_mib +
+                                        (src.no_evict ? (uint64_t) idle_park_free_mib : 0)) * 1024 * 1024;
                 const size_t retained = reuse.bytes() + stage_retained;
                 const size_t additional = estimate > retained ? estimate - retained : 0;
                 // The physical-RAM gate: the incoming snapshot has to fit beside the floor.  make_room()
@@ -11194,6 +11214,14 @@ int main(int argc, char** argv) {
                         std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
                         moved.empty() ? nullptr : &moved);
                 for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
+                if (!saved && strata::core::capture_aborted(err)) {   // STRATA_IDLE_PARK: a request came in - not a failure
+                    std::fprintf(stderr, "strata serve: conversation cache: idle park%s stopped after %.1f ms (a request came "
+                                         "in); nothing parked\n", src.what.c_str(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    err.clear();
+                    idle_park_aborted = true;
+                    return true;
+                }
                 if (!saved) return false;
                 pool_topup();   // what the park took (and what moved out) is allocated again, in the background
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
@@ -11203,8 +11231,17 @@ int main(int argc, char** argv) {
                     const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
                     strata::core::SavedConversation part;
                     if (!strata::core::conversation_snapshot_save(part, view_k, *src.stage_sessions[k], g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
+                            std::move(stage_reuse[k]), &reused_bytes)) {
+                        if (strata::core::capture_aborted(err)) {   // STRATA_IDLE_PARK: as above (the image is dropped)
+                            std::fprintf(stderr, "strata serve: conversation cache: idle park%s stopped at stage %zu after %.1f ms "
+                                                 "(a request came in); nothing parked\n", src.what.c_str(), k + 1,
+                                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                            err.clear();
+                            idle_park_aborted = true;
+                            return true;
+                        }
                         return false;
+                    }
                     image.stage_images.push_back(std::move(part));
                 }
                 const auto mem_after = strata::core::sample_host_memory();
@@ -11215,6 +11252,14 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                // STRATA_IDLE_PARK: the image as captured must fit without an eviction too (put() would evict for it)
+                if (src.no_evict && !conversations.can_fit_superseding(snapshot_bytes, held, image.live.ids, image.live.imgs,
+                                                                       image.checkpoints, image.cvec)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking%s (the %zu MiB image does not fit "
+                                         "beside the %zu parked without an eviction)\n", src.what.c_str(), snapshot_bytes >> 20,
+                                 conversations.size());
+                    return true;
+                }
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
@@ -14464,19 +14509,68 @@ int main(int argc, char** argv) {
                          "command waits", (long long) idle_park_ms, conversations.enabled() ? "" : " - but the conversation "
                          "cache is off here");
         // one park, if one is due (true: one was tried)
+        int64_t idle_park_stops = 0, idle_park_ram_skips = 0;
         auto idle_park_one = [&]() -> bool {
             const double now = idle_park_now();
             idle_park_scan(now);
             const int b = idle_park.pick(now, (double) idle_park_ms);
             if (b < 0) return false;
             idle_park.tried((size_t) b);
+            {   // the host has room for it at all (the floor plus STRATA_IDLE_PARK_FREE_MIB), else not even sized
+                const auto mem = strata::core::sample_host_memory();
+                if (!strata::program::idle_park::ram_allows(mem.has_value(), mem ? mem->available : 0,
+                                                            o.conversation_cache_min_free_mib, idle_park_free_mib)) {
+                    if (++idle_park_ram_skips == 1 || trace)
+                        std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked while idle (below %lld + "
+                                             "%lld MiB free: %s; STRATA_IDLE_PARK_FREE_MIB)\n", b,
+                                     (long long) o.conversation_cache_min_free_mib, (long long) idle_park_free_mib,
+                                     ram_note(mem).c_str());
+                    return true;
+                }
+            }
             const auto t0 = Clock::now();
-            park_slot(b, true);
-            ++idle_parks;
+            {
+                // watched like a request (the watchdog sees a park that stops moving: its copies beat), then the engine's
+                // state before it comes back (idle, or between batch windows)
+                struct IdleParkWatch {
+                    bool was_busy;
+                    const char* prev;
+                    IdleParkWatch()
+                        : was_busy(strata::core::progress().busy.load()), prev(strata::core::progress().where.load()) {
+                        strata::core::progress_at("idle: parking an idle batch slot's conversation (STRATA_IDLE_PARK)");
+                        strata::core::progress_beat();
+                        strata::core::progress().busy.store(true);
+                    }
+                    ~IdleParkWatch() {
+                        strata::core::progress_beat();
+                        strata::core::progress().busy.store(was_busy);
+                        strata::core::progress_at(prev);
+                    }
+                } watch;
+                // a command that comes in stops the capture between its copies (capture_abort.hpp)
+                const strata::core::CaptureAbortScope stop_on_command(
+                    +[](void* c) -> bool {
+                        StdinShared& st = *static_cast<StdinShared*>(c);
+                        std::lock_guard<std::mutex> lk(st.mu);
+                        return !st.lines.empty() || st.eof;
+                    },
+                    in_shared.get());
+                idle_park_aborted = false;
+                park_slot(b, true);
+            }
+            const bool stopped = idle_park_aborted;
+            if (stopped) {   // tried again later, after another idle spell of STRATA_IDLE_PARK_MS
+                idle_park_aborted = false;
+                idle_park.retry((size_t) b, idle_park_now());
+                ++idle_park_stops;
+            } else {
+                ++idle_parks;
+            }
             if (trace)
-                std::fprintf(stderr, "strata trace: idle park of slot %d (%zu tokens) took %.1f ms (%lld so far)\n", b,
-                             bs[(size_t) b].ids.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             (long long) idle_parks);
+                std::fprintf(stderr, "strata trace: idle park of slot %d (%zu tokens) %s after %.1f ms (%lld done, %lld stopped)\n",
+                             b, bs[(size_t) b].ids.size(), stopped ? "stopped" : "ended",
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) idle_parks,
+                             (long long) idle_park_stops);
             return true;
         };
         for (;;) {
@@ -14489,7 +14583,8 @@ int main(int argc, char** argv) {
                         if (piped && !pipe_drain()) return 1;
                         if (!loan_give_back("no admission within the window", true)) return 1;
                     }
-                    // STRATA_IDLE_PARK=2: between windows (the groups in flight finish first, as before an admission)
+                    // STRATA_IDLE_PARK=2: between windows (the groups in flight finish first, as before an admission; the
+                    // decoding slots wait for the park, a command that comes in stops it)
                     if (idle_park_mode >= 2 && conversations.enabled()) {
                         const double now = idle_park_now();
                         idle_park_scan(now);
@@ -14533,7 +14628,7 @@ int main(int argc, char** argv) {
                     if (!any && !loan_give_back("idle", true)) return 1;
                 }
                 // STRATA_IDLE_PARK: nothing decodes - park the idle slots that are due while no command waits (a command
-                // that comes meanwhile waits for at most the park in progress)
+                // that comes meanwhile stops the park in progress between its copies: it waits for one K/V layer's copy)
                 while (idle_park_mode > 0 && conversations.enabled()) {
                     bool waiting = false;
                     {

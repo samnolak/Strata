@@ -7,8 +7,11 @@
 // idle while its tool runs (1-16 s), so the park can happen then.  The tracker below watches each slot's idle state by a
 // key of what it holds (it changes with every turn) and says which slot to park next: the one idle the longest, once it
 // has been idle for at least `min_ms` (an agent that comes straight back to its slot would make a park wasted work), and
-// each held state at most once.  The park itself is park_slot's, with one difference: an idle park never evicts another
-// parked conversation (it is skipped when the image does not fit beside them), so it can only add to the cache.
+// each held state at most once.  The park itself is park_slot's, with these differences: an idle park never evicts another
+// parked conversation (it is skipped when the image does not fit beside them, and drops the copies it supersedes only
+// when it stores the image), so it can only add to the cache; it leaves STRATA_IDLE_PARK_FREE_MIB more RAM free than the
+// conversation cache's floor; and it stops between its copies when a request comes in (core/capture_abort.hpp), so the
+// request waits for at most one K/V layer's copy, not the whole park.
 #pragma once
 
 #include <cstddef>
@@ -31,6 +34,24 @@ inline int64_t min_ms_from(const char* v) {
     if (v == nullptr || *v == '\0') return 500;
     const long long n = std::atoll(v);
     return n < 0 ? 500 : (int64_t) n;
+}
+
+/// STRATA_IDLE_PARK_FREE_MIB: the free RAM an idle park leaves above --conversation-cache-min-free-mib (default 4096 MiB;
+/// negative: the default).  An idle park's copy may be one nobody restores (the agent comes back to its own slot), so it
+/// takes RAM only with this much more to spare than an admission's park would.
+inline int64_t free_mib_from(const char* v) {
+    if (v == nullptr || *v == '\0') return 4096;
+    const long long n = std::atoll(v);
+    return n < 0 ? 4096 : (int64_t) n;
+}
+
+/// Whether an idle park may start at all: the RAM available now (none read: no) leaves `floor_mib + free_mib` free.  The
+/// capture's own admission (its size against the same floor) follows; this only spares the work of sizing and splitting
+/// the image when the host has no room anyway.
+inline bool ram_allows(bool have_reading, uint64_t available_bytes, int64_t floor_mib, int64_t free_mib) {
+    if (!have_reading) return false;
+    const uint64_t need = ((uint64_t) (floor_mib > 0 ? floor_mib : 0) + (uint64_t) (free_mib > 0 ? free_mib : 0)) << 20;
+    return available_bytes >= need;
 }
 
 /// What a slot holds, as a key: 0 when it is not a candidate (decoding, empty, pictures, nothing cached, too short or
@@ -82,6 +103,13 @@ struct Tracker {
     /// The park of slot b's current key was tried: not again until the slot holds something else.
     void tried(size_t b) {
         if (b < done.size()) done[b] = 1;
+    }
+    /// The park of slot b was stopped part-way (a request came in): it may be tried again for the same key, after a new
+    /// `min_ms` wait from `now_ms` (the request that stopped it most likely uses the engine for a while).
+    void retry(size_t b, double now_ms) {
+        if (b >= done.size()) return;
+        done[b] = 0;
+        since[b] = now_ms;
     }
 };
 

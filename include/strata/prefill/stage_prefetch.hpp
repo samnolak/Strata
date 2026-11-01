@@ -93,4 +93,24 @@ struct WalkCursor {
     size_t left() const { return ents.size() - next; }
 };
 
+/// The issue loop of stage_prefetch_issue, checked by its own calls' return codes (not the thread's last CUDA error, which
+/// may hold another part's pending error): for slot i < n, wait(i) when live(i) (the slot's release event), copy(i) (the
+/// DMA), record(i) (its "copied" event) - each returns 0 on success, else the error code it got.  The first failing step
+/// ends the loop.  Returns how many slots had all their steps succeed; `*first_err` gets the failing code (0: none) and
+/// `*reached` (if given) the slots a step was tried for (the failing one included: its copy may be queued).
+template <class Live, class Wait, class Copy, class Record>
+inline size_t issue_checked(size_t n, Live&& live, Wait&& wait, Copy&& copy, Record&& record, int* first_err,
+                            size_t* reached = nullptr) {
+    int e = 0;
+    size_t i = 0;
+    for (; i < n; ++i) {
+        if (live(i) && (e = (int) wait(i)) != 0) break;
+        if ((e = (int) copy(i)) != 0) break;
+        if ((e = (int) record(i)) != 0) break;
+    }
+    if (first_err != nullptr) *first_err = e;
+    if (reached != nullptr) *reached = e != 0 ? i + 1 : i;
+    return i;
+}
+
 }  // namespace strata::prefill::stage_prefetch

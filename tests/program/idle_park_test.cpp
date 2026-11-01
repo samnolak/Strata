@@ -3,6 +3,9 @@
 #include <cstdlib>
 
 #include "strata/program/idle_park.hpp"
+#include "strata/core/capture_abort.hpp"
+
+#include <string>
 
 using namespace strata::program::idle_park;
 
@@ -62,6 +65,57 @@ int main() {
         CHECK(t.pick(1000, 500) == 5);
         t.tried(9);   // out of range: ignored
         CHECK(t.pick(1000, 500) == 5);
+    }
+    // STRATA_IDLE_PARK_FREE_MIB and the RAM gate before an idle park
+    CHECK(free_mib_from(nullptr) == 4096);
+    CHECK(free_mib_from("") == 4096);
+    CHECK(free_mib_from("0") == 0);
+    CHECK(free_mib_from("8192") == 8192);
+    CHECK(free_mib_from("-1") == 4096);
+    CHECK(!ram_allows(false, ~0ull, 0, 0));                                   // no reading: no park
+    CHECK(ram_allows(true, (12288ull + 4096) << 20, 12288, 4096));            // exactly the floor plus the headroom
+    CHECK(!ram_allows(true, ((12288ull + 4096) << 20) - 1, 12288, 4096));
+    CHECK(ram_allows(true, 0, 0, 0));
+    CHECK(ram_allows(true, 1ull << 20, -5, -5));                              // negative figures count as 0
+    // a park stopped part-way (a request came in) is tried again after a new wait
+    {
+        Tracker t;
+        t.see(0, slot_key(5000, 3, true), 0);
+        CHECK(t.pick(600, 500) == 0);
+        t.tried(0);
+        CHECK(t.pick(700, 500) == -1);
+        t.retry(0, 800);
+        double due = 0;
+        CHECK(t.pick(900, 500, &due) == -1 && due == 1300);
+        CHECK(t.pick(1300, 500) == 0);
+        t.see(0, slot_key(5000, 3, true), 1400);   // the same state: the retry's clock stays
+        CHECK(t.pick(1400, 500) == 0);
+        t.retry(7, 0);                              // out of range: ignored
+        CHECK(t.key.size() == 1);
+    }
+    // capture_abort.hpp: a capture asks the thread's scope; none (every other caller): never stops
+    {
+        using namespace strata::core;
+        std::string err;
+        CHECK(!capture_abort_requested());
+        CHECK(capture_continue(err) && err.empty());
+        bool stop = false;
+        {
+            CaptureAbortScope s(+[](void* c) { return *static_cast<bool*>(c); }, &stop);
+            CHECK(capture_continue(err) && err.empty());
+            stop = true;
+            CHECK(!capture_continue(err) && capture_aborted(err));
+            err.clear();
+            {
+                bool inner = false;   // scopes nest: the inner one asks, the outer comes back after
+                CaptureAbortScope s2(+[](void* c) { return *static_cast<bool*>(c); }, &inner);
+                CHECK(capture_continue(err));
+            }
+            CHECK(!capture_continue(err));
+        }
+        err.clear();
+        CHECK(capture_continue(err) && err.empty());   // gone with its scope
+        CHECK(!capture_aborted("stage sync failed") && !capture_aborted(""));
     }
     if (failed) { std::fprintf(stderr, "idle_park_test: %d failure(s)\n", failed); return 1; }
     std::printf("idle_park_test: PASS\n");
