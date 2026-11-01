@@ -1,4 +1,5 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/capture_abort.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
 #include <chrono>
@@ -530,6 +531,9 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     const auto p0 = now();
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
+    // STRATA_IDLE_PARK (capture_abort.hpp): an idle park stops here, between its checkpoint copies and between its K/V
+    // layers when a request comes in (no scope on this thread: never)
+    if (!capture_continue(error)) return false;
     // Build into a new object so a failure cannot publish a partial snapshot.
     SavedConversation captured;
     captured.geometry = geometry_key(g);
@@ -548,6 +552,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
             captured.checkpoints.push_back(std::move(c));
         }
     const auto p2 = now();
+    if (!capture_continue(error)) return false;
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss);
@@ -577,6 +582,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     struct Abandon { bool on; ~Abandon() { if (on) conversation_park_async_abandon(); } } abandon{staged};
     double kv_max = 0, kv_sum = 0;   // (STRATA_PARK_TRACE: the per-layer save time)
     for (size_t j = 0; j < layers; ++j) {
+        if (!capture_continue(error)) return false;   // (`abandon` gives back a STRATA_PARK_ASYNC stage)
         const auto k0 = now();
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
                                   unchanged, reused_bytes)) return false;

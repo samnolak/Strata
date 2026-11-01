@@ -7865,16 +7865,29 @@ bool Prefill::stage_prefetch_issue(int64_t T, int64_t p0) {
     if (ents.empty()) return false;
     const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
     const core::OnDevice on(nm.device);
-    for (size_t i = 0; i < ents.size(); ++i) {
-        const int sl = (int) i;
-        if (nm.stage_live[sl]) cudaStreamWaitEvent(nm.copy, nm.used[nm.used_of[sl]], 0);
-        cudaMemcpyAsync(nm.stage_dev[sl], ents[i].blob, (size_t) lay0.blob_bytes(ents[i].l), cudaMemcpyHostToDevice, nm.copy);
-        cudaEventRecord(nm.copied[sl], nm.copy);
-        nm.stage_live[sl] = true;
-    }
-    if (cudaPeekAtLastError() != cudaSuccess) {   // nothing half-issued is left to the next stage
+    // each call's own return code (the thread's last error may be another part's pending one: not read, not cleared)
+    int issue_err = 0;
+    size_t reached = 0;
+    (void) stage_prefetch::issue_checked(
+        ents.size(), [&](size_t i) { return nm.stage_live[(int) i]; },
+        [&](size_t i) { return cudaStreamWaitEvent(nm.copy, nm.used[nm.used_of[(int) i]], 0); },
+        [&](size_t i) {
+            return cudaMemcpyAsync(nm.stage_dev[(int) i], ents[i].blob, (size_t) lay0.blob_bytes(ents[i].l),
+                                   cudaMemcpyHostToDevice, nm.copy);
+        },
+        [&](size_t i) { return cudaEventRecord(nm.copied[(int) i], nm.copy); }, &issue_err, &reached);
+    for (size_t i = 0; i < reached; ++i) nm.stage_live[(int) i] = true;   // (as each issued slot was before)
+    if (issue_err != 0) {   // nothing half-issued is left to the next stage
+        // the failing call set the thread's last error to its own code (it replaced whatever was pending): clear that
+        // one, so it is not reported later as someone else's
         (void) cudaGetLastError();
-        cudaStreamSynchronize(nm.copy);
+        if (reached > 0) (void) cudaStreamSynchronize(nm.copy);
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "strata prefill: STRATA_STAGE_PREFETCH: an early copy into the next stage failed (%s); "
+                                 "that stage issues its own\n", cudaGetErrorString((cudaError_t) issue_err));
+        }
         return false;
     }
     nm.pre.mode = mode;

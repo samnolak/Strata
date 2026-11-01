@@ -110,6 +110,27 @@ int main() {
         CHECK(!w.take(0, 8, 0, B(0), true));   // the next layer's first staging (slot 0 again): the end
         CHECK(!w.live && w.left() == 12);
     }
+    // issue_checked: the loop's own return codes decide; the first failing step ends it
+    {
+        std::vector<int> calls;
+        auto live = [&](size_t i) { return i == 1; };
+        auto ok = [&](int tag) { return [&calls, tag](size_t i) { calls.push_back(tag * 100 + (int) i); return 0; }; };
+        int err = -1;
+        size_t reached = 99;
+        CHECK(issue_checked(3, live, ok(1), ok(2), ok(3), &err, &reached) == 3 && err == 0 && reached == 3);
+        CHECK((calls == std::vector<int>{200, 300, 101, 201, 301, 202, 302}));   // the wait only for the live slot
+        calls.clear();
+        auto copy_fails_at_1 = [&](size_t i) { calls.push_back(200 + (int) i); return i == 1 ? 11 : 0; };
+        CHECK(issue_checked(3, live, ok(1), copy_fails_at_1, ok(3), &err, &reached) == 1 && err == 11 && reached == 2);
+        CHECK((calls == std::vector<int>{200, 300, 101, 201}));                  // nothing after the failing copy
+        calls.clear();
+        auto wait_fails = [&](size_t) { return 4; };
+        CHECK(issue_checked(3, live, wait_fails, ok(2), ok(3), &err, &reached) == 1 && err == 4 && reached == 2);
+        auto record_fails_at_0 = [&](size_t i) { return i == 0 ? 7 : 0; };
+        CHECK(issue_checked(3, live, ok(1), ok(2), record_fails_at_0, &err, &reached) == 0 && err == 7 && reached == 1);
+        CHECK(issue_checked(0, live, ok(1), ok(2), ok(3), &err, &reached) == 0 && err == 0 && reached == 0);
+        CHECK(issue_checked(2, live, ok(1), ok(2), ok(3), nullptr) == 2);         // the outputs are optional
+    }
     if (failed) { std::fprintf(stderr, "stage_prefetch_test: %d failure(s)\n", failed); return 1; }
     std::printf("stage_prefetch_test: PASS\n");
     return 0;

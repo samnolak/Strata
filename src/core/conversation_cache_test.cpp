@@ -761,5 +761,41 @@ int main() {
         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
     }
+    {
+        // STRATA_IDLE_PARK: can_fit_superseding answers as can_fit would after put()'s drop_superseded, and changes
+        // nothing (an idle park that is then skipped leaves the copies of its conversation parked)
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation a = image({1, 2, 3, 4, 60, 70});
+        a.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 60})};
+        SavedConversation b = image({9, 8, 7, 6});
+        const size_t one = a.bytes();
+        check(b.bytes() <= one, "test images: the unrelated one is not larger");
+        ConversationCache slots_full(1 << 20, 2);
+        check(slots_full.put(std::move(a)) && slots_full.put(std::move(b)) && slots_full.size() == 2, "two parked");
+        const std::vector<int32_t> next_ids = {1, 2, 3, 4, 60, 70, 80, 81};
+        const std::vector<ConversationCheckpoint> next_chain = {cp({1, 2, 3, 4, 60})};
+        check(!slots_full.can_fit(one), "both slots taken: no room without an eviction");
+        check(slots_full.can_fit_superseding(one, 0, next_ids, {}, next_chain, true),
+              "the next turn of a parked conversation fits once its old copy is dropped");
+        check(!slots_full.can_fit_superseding(one, 0, {5, 5, 5, 5}, {}, {cp({5, 5})}, true),
+              "an unrelated conversation does not fit without an eviction");
+        check(!slots_full.can_fit_superseding(one, 0, next_ids, {}, next_chain, false), "the other steering mode drops nothing");
+        check(slots_full.size() == 2 && slots_full.superseded() == 0 && slots_full.evictions() == 0,
+              "the check drops and evicts nothing");
+
+        SavedConversation a2 = image({1, 2, 3, 4, 60, 70});
+        a2.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 60})};
+        const size_t a2_bytes = a2.bytes();
+        ConversationCache bytes_full(a2_bytes + one / 2, 8);   // one image and a half
+        check(bytes_full.put(std::move(a2)) && bytes_full.size() == 1, "one parked");
+        check(!bytes_full.can_fit(one), "the byte budget is short without an eviction");
+        check(bytes_full.can_fit_superseding(one, 0, next_ids, {}, next_chain, true), "it fits once the old copy is dropped");
+        check(!bytes_full.can_fit_superseding(one, one, next_ids, {}, next_chain, true), "a held image counts against it");
+        check(!bytes_full.can_fit_superseding(SIZE_MAX, 0, next_ids, {}, next_chain, true) &&
+              !bytes_full.can_fit_superseding(1, SIZE_MAX, next_ids, {}, next_chain, true), "overflow is refused");
+        check(bytes_full.size() == 1 && bytes_full.superseded() == 0, "still unchanged");
+        ConversationCache off(0, 0);
+        check(!off.can_fit_superseding(1, 0, next_ids, {}, next_chain, true), "a disabled cache fits nothing");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

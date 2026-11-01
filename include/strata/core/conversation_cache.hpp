@@ -464,21 +464,10 @@ public:
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
-        auto held = [&](const ConversationCheckpoint& c) {
-            if (c.ids == ids && c.imgs == images) return true;
-            for (const auto& k : checkpoints)
-                if (k.ids == c.ids && k.imgs == c.imgs) return true;
-            return false;
-        };
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
-            const auto& e = entries_[i];
-            const ConversationCheckpoint* deepest = nullptr;
-            for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest) &&
-                !(guarded_ != 0 && serials_[i] == guarded_)) {
-                bytes_ -= e.bytes();
+            if (superseded_at(i, ids, images, checkpoints, cvec)) {
+                bytes_ -= entries_[i].bytes();
                 erase(i);
                 ++dropped;
                 continue;
@@ -487,6 +476,19 @@ public:
         }
         superseded_ += dropped;
         return dropped;
+    }
+    // STRATA_IDLE_PARK: can_fit() as it would answer after drop_superseded(ids, images, checkpoints, cvec) - put() drops
+    // those entries before it stores the image - without dropping anything (an idle park that does not fit then leaves
+    // the cache exactly as it was).  Read-only.
+    bool can_fit_superseding(size_t incoming, size_t held, const std::vector<int32_t>& ids,
+                             const std::vector<ConversationImageKey>& images,
+                             const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
+        size_t n = 0, b = 0;
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (superseded_at(i, ids, images, checkpoints, cvec)) { ++n; b += entries_[i].bytes(); }
+        const size_t left = entries_.size() - n, left_bytes = bytes() - std::min(b, bytes());
+        return enabled() && held <= budget_ && incoming <= budget_ - held && left < slots_ &&
+               left_bytes <= budget_ - held - incoming;
     }
     // A batch slot's chain holds one checkpoint (the one its admission copied in), while the main session's parked copy of the same
     // conversation keeps the whole chain - the root checkpoint at the end of an agent's system prompt and tools among them, the one its
@@ -549,6 +551,22 @@ public:
     }
 
 private:
+    // drop_superseded()'s rule for entry i (see there)
+    bool superseded_at(size_t i, const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                       const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
+        auto held = [&](const ConversationCheckpoint& c) {
+            if (c.ids == ids && c.imgs == images) return true;
+            for (const auto& k : checkpoints)
+                if (k.ids == c.ids && k.imgs == c.imgs) return true;
+            return false;
+        };
+        const auto& e = entries_[i];
+        const ConversationCheckpoint* deepest = nullptr;
+        for (const auto& c : e.checkpoints)
+            if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+        return e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest) &&
+               !(guarded_ != 0 && serials_[i] == guarded_);
+    }
     void erase(size_t index) {
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         serials_.erase(serials_.begin() + (std::ptrdiff_t) index);
