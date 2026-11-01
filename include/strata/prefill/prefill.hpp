@@ -305,9 +305,10 @@ public:
     /// what a run did.
     int64_t lm_plan_super_chunk(int64_t n, int64_t chunk = 0) const;
     /// STRATA_BRANCH_CHECKPOINT_ALIGN: the super-chunk run() would read an n-token run in NOW (the walk's gate, every
-    /// stage's lm_prepare with this VRAM - its free memory, not an allocation -, the even split; with `pin` > 0 the pinned
-    /// size); 0 when the walk would not take it (`why`).  Called after lend(), so the buffers' chunk is the run's.  Not
-    /// checked: the pinned host RAM the run allocates (a run that cannot get it logs, see generate.cpp).
+    /// stage's lm_prepare with this VRAM - its free bytes, not an allocation -, the even split; with `pin` > 0 the pinned
+    /// size); 0 when the walk would not take it (`why`).  Called after lend(), so the buffers' chunk is the run's.  The
+    /// pinned host buffers are grown for it (grow-only, the run reuses them); a fragmented card can still refuse the
+    /// run's device buffers (logged by the read).
     int64_t lm_probe(int64_t n, int64_t pin, std::string& why);
     /// pin_super_chunk for a scope (reset on every way out)
     struct PinScope {

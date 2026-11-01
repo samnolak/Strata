@@ -11565,7 +11565,8 @@ int main(int argc, char** argv) {
                 // N1: only the checkpoint this call saved (not one of that length a read before saved, nor nothing)
                 if (saved && branch_align_env() && ckpt_new_used != 0)
                     for (ConvCheckpoint& k : checks)
-                        if (k.used == ckpt_new_used && (int64_t) k.ids.size() == done && !k.branch) {
+                        if (k.used == ckpt_new_used && k.read_serial == ckpt_read_serial &&
+                            (int64_t) k.ids.size() == done && !k.branch) {
                             const int64_t S = seg_al_grid > 0 ? seg_al_grid : sp.last_super_chunk();
                             k.mark = true;
                             const bool on_grid = seg_al_anchor >= 0 && S > 0 && done > seg_al_anchor &&
@@ -17248,6 +17249,30 @@ int main(int argc, char** argv) {
                             }
                             continue;   // (nothing read yet: `at` stays, the next cut reads the segment)
                         }
+                    }
+                }
+                // P1: before every aligned part, the walk asked again whether it takes THIS part in the pinned size now
+                // (VRAM may have moved since the probe: a checkpoint saved, the host K/V grown).  Before any cut is
+                // made (the first part of a fresh segment) the cut is dropped as above; later only logged
+                if (al_part && al_grid > 0) {
+                    std::string why;
+                    const int64_t T = std::max<int64_t>(sp.chunk(), 1);
+                    const int64_t want_s = std::min<int64_t>(al_grid, (to - at + T - 1) / T * T);
+                    const int64_t s_pin = sp.lm_probe(to - at, al_grid, why);
+                    if (s_pin != want_s) {
+                        std::fprintf(stderr, "strata serve: STRATA_BRANCH_CHECKPOINT_ALIGN: [%lld, %lld) cannot be read in "
+                                             "%lld-token super-chunks now (%lld%s%s): %s\n", (long long) at, (long long) to,
+                                     (long long) want_s, (long long) s_pin, why.empty() ? "" : " - ", why.c_str(),
+                                     !al_resumed && branch_at > at && to == branch_at
+                                         ? "no aligned checkpoint, the segment is read in one run"
+                                         : "this read is not the unaligned one bit for bit");
+                        if (!al_resumed && branch_at > at && to == branch_at) {
+                            branch_at = -1;
+                            al_grid = 0;
+                            al_from = al_end = -1;
+                            continue;
+                        }
+                        al_exact = false;
                     }
                 }
                 if (win) merge_at = merge_from(at, to);   // (after the refill: the loans are back)
