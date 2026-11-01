@@ -400,6 +400,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(prefill_plan_test PRIVATE include)
   add_test(NAME prefill_plan_test COMMAND prefill_plan_test)
 
+  # STRATA_BRANCH_CHECKPOINT_ALIGN: the super-chunk grid and the aligned branch checkpoint's rules (header-only, no GPU)
+  add_executable(branch_align_test tests/program/branch_align_test.cpp)
+  target_include_directories(branch_align_test PRIVATE include)
+  add_test(NAME branch_align_test COMMAND branch_align_test)
+
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)

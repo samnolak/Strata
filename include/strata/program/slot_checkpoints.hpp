@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <vector>
 
 namespace strata::program {
@@ -75,6 +76,45 @@ inline int64_t branch_checkpoint_boundary(int64_t shared, int64_t read_from, int
     const int64_t end = turn_at > 0 ? turn_at : n - 1;
     if (margin <= 0 || shared <= 0 || shared - read_from < margin || shared >= end) return -1;
     return shared;
+}
+
+// STRATA_BRANCH_CHECKPOINT_ALIGN=1: the branch point moved back onto the grid a read of its segment cuts at anyway.  The
+// layer-major walk reads the segment [anchor, seg_end) - between two of the read's own cuts (where it starts, the root,
+// the turn boundary, the last prompt token) - in super-chunks of `grid` tokens from `anchor`, so a stop at anchor +
+// k grid ends a super-chunk the read ends there anyway: with every part of the segment read in that super-chunk
+// (Prefill::pin_super_chunk) the read with the stop computes the bits of the read without it, and a read that goes on
+// from the checkpoint those of the read from the anchor.  -1 for none: k >= 1, at least `margin` past `read_from`
+// (where this read starts; a checkpoint at it is the one restored) and before `seg_end`.
+inline int64_t aligned_branch_boundary(int64_t shared, int64_t anchor, int64_t grid, int64_t read_from, int64_t seg_end,
+                                       int64_t margin) {
+    if (margin <= 0 || grid <= 0 || anchor < 0 || shared <= anchor || shared >= seg_end) return -1;
+    const int64_t at = anchor + (shared - anchor) / grid * grid;
+    if (at <= anchor || at - read_from < margin || at >= seg_end) return -1;
+    return at;
+}
+
+// A read that goes on from an aligned branch checkpoint at `at` (taken on the grid of the read from `anchor`) computes
+// the bits of the read from the anchor only where `at` lies on the grid of THAT read: `grid` is the super-chunk the read
+// of this prompt's segment [anchor, seg_end) takes, and it changes with the segment's length (the even split: a
+// transcript that grows past 48K from its anchor goes from 24K to 32K super-chunks).
+inline bool aligned_resume_ok(int64_t at, int64_t anchor, int64_t grid, int64_t seg_end) {
+    return anchor >= 0 && grid > 0 && at > anchor && at < seg_end && (at - anchor) % grid == 0;
+}
+
+// The segment of a read that holds position p: from the last of the read's cuts at or before p (`start`, where the
+// read starts, when none) to the first after it (`last`, the last prompt token, when none).  Cuts outside (start, last)
+// (-1: absent) are ignored.  A cut AT p makes p the segment's start, so no aligned point lies before it in the segment.
+struct ReadSegment {
+    int64_t from = -1, end = -1;
+};
+inline ReadSegment read_segment_of(int64_t p, int64_t start, std::initializer_list<int64_t> cuts, int64_t last) {
+    ReadSegment s{start, last};
+    for (const int64_t c : cuts) {
+        if (c <= start || c >= last) continue;
+        if (c <= p && c > s.from) s.from = c;
+        if (c > p && c < s.end) s.end = c;
+    }
+    return s;
 }
 
 } // namespace strata::program

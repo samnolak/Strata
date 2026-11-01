@@ -510,6 +510,22 @@ The restored state is the one the read had at that point, but the cut changes th
 differently from one read without it. With the exactness settings below, 160-token greedy answers: 11 of 12 equal;
 the twelfth differed from its first token, and the same way for a read that only stopped there (no restore).
 
+`STRATA_BRANCH_CHECKPOINT_ALIGN=1` (opt-in, with `STRATA_BRANCH_CHECKPOINT=<margin>`) makes it exact. The layer-major
+walk reads a segment of the prompt (between two of the read's own cuts: where it starts, the root, the turn boundary,
+the last token) in super-chunks from the segment's start, and their size depends on the segment's length
+(`include/strata/prefill/lm_plan.hpp`: 32K, or near-equal pieces of 24K for 33-48K and 65-72K); each super-chunk is
+one MoE launch per layer over all its tokens, so a cut anywhere else changes which tokens share a launch. With the
+switch the branch checkpoint moves back to the last super-chunk end before the branch point
+(`aligned_branch_boundary`), both parts are read in the segment's super-chunk (`Prefill::pin_super_chunk`), and a
+later prompt goes on from such a checkpoint only when it lies on the grid of that prompt's own read from the same
+anchor (`branch_resume_ok`: the same segment end, the same grid); it then reads the rest of the segment in that grid.
+Both compute the bits of the read without the checkpoint. The price: the next query reads up to one super-chunk more
+(on average half of one), and nothing aligned exists before the first super-chunk end (a segment under ~33K tokens).
+A request that cannot read that way (pieces, `pin=`, pictures, co-read, a message boundary, `STRATA_CKPT_REREAD`,
+`STRATA_PIPED_CONCURRENT`, `STRATA_PIPED_READ_PIECE`) does not use or take an aligned checkpoint; a part the walk could
+not read in the pinned size (VRAM) is logged (`STRATA_BRANCH_CHECKPOINT_ALIGN: [a, b) was read ...`) and its checkpoint
+is not continued from. CPU test: `tests/program/branch_align_test.cpp`.
+
 ### Server: placement by what the slots hold (`STRATA_SLOT_CACHE_AFFINITY=1`)
 
 With `"env": {"STRATA_SLOT_CACHE_AFFINITY": "1"}` in the server config and pipelined groups, `pick_slot` asks the

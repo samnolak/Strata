@@ -356,6 +356,19 @@ bool slot_ckpt_move_env() {
     }();
     return on;
 }
+// STRATA_BRANCH_CHECKPOINT_ALIGN=1 (read once; off by default; needs STRATA_BRANCH_CHECKPOINT=<margin>): the branch
+// checkpoint goes back to the super-chunk grid of its segment's read (slot_checkpoints.hpp aligned_branch_boundary), the
+// parts of that segment are read in its super-chunk (Prefill::pin_super_chunk) and a read goes on from such a checkpoint
+// only where it lies on the grid of the read from its anchor - so the request that takes it and every request that goes
+// on from it compute the bits they compute without it.
+bool branch_align_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_BRANCH_CHECKPOINT_ALIGN");
+        const char* m = std::getenv("STRATA_BRANCH_CHECKPOINT");
+        return v != nullptr && std::atoi(v) != 0 && m != nullptr && std::atoll(m) > 0;
+    }();
+    return on;
+}
 // STRATA_SLOT_COPY_BATCHSYNC=1 (read once; off by default): the direct slot copy (STRATA_SLOT_COPY_DIRECT) only queues
 // its copies on each device's private copy stream and synchronizes every device once at the end, instead of waiting
 // for each of its ~116 copies.  A streamed K/V state's residency refresh waits for its copies through an event.  The
@@ -2042,6 +2055,7 @@ public:
 private:
     static void clear_marks(ConvCheckpoint& c) {
         c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false; c.dev_tag = 0; c.branch = false;
+        c.branch_anchor = -1; c.branch_grid = 0;
         for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
     }
     bool on_;
@@ -15174,12 +15188,60 @@ int main(int argc, char** argv) {
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
+            // STRATA_BRANCH_CHECKPOINT_ALIGN: the end of the segment that holds position p in this prompt's read from
+            // `from` - the first of the read's own cuts past p (below: the root boundary of a read from 0, the turn
+            // boundary, the last prompt token) - and whether this request reads the aligned way at all: every part in
+            // one run (no pieces, no given-way or concurrent read), no pin= / re-read / message boundary / co-read /
+            // picture.  A branch checkpoint is a place to go on from only when it lies on the grid of the read of its
+            // segment from its anchor; else this request reads from a checkpoint before it, as without the switch.
+            auto natural_end = [&](int64_t from, int64_t p) -> int64_t {
+                int64_t turn = -1, root = -1;
+                if (o.prompt_cache > 0 && o.turn_token >= 0)
+                    for (int64_t i = n - 1; i > from; --i)
+                        if (ids[(size_t) i] == o.turn_token) { turn = i; break; }
+                if (turn > 0 && o.tail_role_token >= 0)
+                    for (int64_t i = turn - 1; i > from; --i)
+                        if (ids[(size_t) i] == o.turn_token) {
+                            if (ids[(size_t) i + 1] == o.tail_role_token) turn = i;
+                            break;
+                        }
+                const int64_t last = turn;
+                if (!req_ckpt) turn = -1;
+                if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && from == 0)
+                    for (int64_t i = 1; i < last; ++i)
+                        if (ids[(size_t) i] == o.turn_token) {
+                            if (i >= o.prompt_cache_root) root = i;
+                            break;
+                        }
+                int64_t e = n - 1;
+                for (const int64_t c : {turn, root})
+                    if (c > p && c < e) e = c;
+                return e;
+            };
+            static const bool align_env_ok = [] {
+                auto on = [](const char* k) { const char* v = std::getenv(k); return v != nullptr && std::atoi(v) != 0; };
+                return std::getenv("STRATA_CKPT_REREAD") == nullptr && !on("STRATA_PIPED_CONCURRENT") &&
+                       !on("STRATA_PIPED_READ_PIECE") && !on("STRATA_CACHE_MESSAGE_BOUNDARY");
+            }();
+            const bool align_req = branch_align_env() && align_env_ok && o.prompt_cache > 0 && req_ckpt && req_pin <= 0 &&
+                                   req_imgs.empty() && co_set.empty() && (o.batch <= 0 || piped);
+            auto branch_resume_ok = [&](const ConvCheckpoint& c) -> bool {
+                if (!c.branch || !branch_align_env()) return true;
+                if (!align_req || c.branch_anchor < 0) return false;
+                const int64_t at = (int64_t) c.ids.size(), a = c.branch_anchor;
+                // the read from the anchor reads [a, end) as one segment - no cut of its own in (a, at], the same end as
+                // a read from `at` - on the grid the checkpoint was taken on (the grid changes with the segment's length)
+                const int64_t end = natural_end(a, a);
+                if (end <= at || natural_end(at, at) != end) return false;
+                const int64_t grid = sp.lm_plan_super_chunk(end - a);
+                return grid == c.branch_grid && strata::program::aligned_resume_ok(at, a, grid, end);
+            };
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
-                    if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
+                    if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs) && branch_resume_ok(c)) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
@@ -15196,7 +15258,8 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : bs[(size_t) b].checks) {
                         const int64_t L = (int64_t) c.ids.size();
                         if (L > resume && L <= (int64_t) live.size() && starts_with(c.ids, c.imgs) &&
-                            std::equal(c.ids.begin(), c.ids.end(), live.begin()) && imgs_below(live_imgs, L) == c.imgs) {
+                            std::equal(c.ids.begin(), c.ids.end(), live.begin()) && imgs_below(live_imgs, L) == c.imgs &&
+                            branch_resume_ok(c)) {
                             resume = L;
                             from_live = false;
                             lent_slot = b;
@@ -15231,7 +15294,8 @@ int main(int argc, char** argv) {
                         slot_ck = nullptr;
                     }
                     for (const ConvCheckpoint& c : sl.checks)
-                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs) &&
+                            branch_resume_ok(c)) {
                             slot_source = b;
                             slot_tokens = (int64_t) c.ids.size();
                             slot_ck = &c;
@@ -15294,7 +15358,7 @@ int main(int argc, char** argv) {
                     if ((sl.cached || sl.active) && !sl.img && sl.cvec == want_cvec) leaves(sl.ids, b);
                 }
             }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            const auto parked = conversations.best(ids, req_imgs, want_cvec, branch_resume_ok);
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
@@ -16975,15 +17039,84 @@ int main(int argc, char** argv) {
             // text of its transcript) leaves the last query a few dozen tokens before its end: its turn checkpoint is
             // past that point, so each query read its whole transcript (2026-10-16: 42-74K tokens, 15-27 s).  With a
             // checkpoint at the point it left, the next query - which leaves this one later - reads only the rest.
-            const int64_t branch_at = req_ckpt ? strata::program::branch_checkpoint_boundary(branch_shared, read_from,
-                                                                                            turn_at, n, branch_margin)
-                                               : -1;
+            // STRATA_BRANCH_CHECKPOINT_ALIGN: the segment of this read that is read on a super-chunk grid - [al_from,
+            // al_end), in super-chunks of al_grid tokens from al_from (0: none, the read as before).  A request that goes
+            // on from an aligned branch checkpoint reads the rest of that checkpoint's segment on the grid of the read
+            // from its anchor (branch_resume_ok let it go on there only where that grid holds it); a request whose
+            // branch point lies in such a segment stops at the last grid point before it, not at the branch point.
+            int64_t al_from = -1, al_end = -1, al_grid = 0;
+            bool al_exact = true;
+            if (branch_align_env() && resume > 0 && reread_to <= 0 && !from_live) {
+                const ConvCheckpoint* rc = nullptr;   // the checkpoint this request goes on from, when it is a branch one
+                for (const ConvCheckpoint& c : checks)
+                    if ((int64_t) c.ids.size() == resume && c.branch && starts_with(c.ids, c.imgs)) { rc = &c; break; }
+                if (rc == nullptr && lent_slot >= 0)
+                    for (const ConvCheckpoint& c : bs[(size_t) lent_slot].checks)
+                        if ((int64_t) c.ids.size() == resume && c.branch && starts_with(c.ids, c.imgs)) { rc = &c; break; }
+                if (rc != nullptr) {
+                    if (!align_req || resumed_from0 || !branch_resume_ok(*rc)) {   // (the choice above leaves such out)
+                        al_exact = false;
+                        std::fprintf(stderr, "strata serve: branch checkpoint at %lld: not on the grid of this prompt's "
+                                             "read from its anchor - this read is not that read bit for bit\n",
+                                     (long long) resume);
+                    } else {
+                        al_from = rc->branch_anchor;
+                        al_end = natural_end(resume, resume);
+                        al_grid = sp.lm_plan_super_chunk(al_end - al_from);
+                    }
+                }
+            }
+            int64_t branch_at = -1;
+            if (req_ckpt && branch_align_env()) {
+                if (align_req && al_exact && branch_shared > 0 && !resumed_from0 && message_at < 0 && pin_at < 0) {
+                    // the segment of this read that holds the branch point: from the last of its own cuts at or before it
+                    // (where the read starts - for a read from an aligned checkpoint, the read from its anchor -, the root,
+                    // the turn boundary) to the first after it
+                    const auto seg = strata::program::read_segment_of(branch_shared, al_from >= 0 ? al_from : read_from,
+                                                                      {root_at, turn_at}, n - 1);
+                    const int64_t anchor = seg.from, seg_end = seg.end;
+                    if (al_from < 0 || (anchor == al_from && seg_end == al_end)) {
+                        const int64_t grid = al_from >= 0 ? al_grid : sp.lm_plan_super_chunk(seg_end - anchor);
+                        branch_at = strata::program::aligned_branch_boundary(branch_shared, anchor, grid, read_from, seg_end,
+                                                                             branch_margin);
+                        if (branch_at >= 0) {
+                            al_from = anchor;
+                            al_end = seg_end;
+                            al_grid = grid;
+                        } else if (trace && branch_shared - read_from >= branch_margin && branch_shared < seg_end) {
+                            std::fprintf(stderr, "strata trace: branch point at %lld: no grid point past %lld before it "
+                                                 "(%lld-token super-chunks from %lld; 0: not a layer-major read)\n",
+                                         (long long) branch_shared, (long long) read_from, (long long) grid,
+                                         (long long) anchor);
+                        }
+                    }
+                }
+                if (branch_at >= 0) {   // a checkpoint already there (one the choice above left out) is saved again
+                    auto there = [&](const ConvCheckpoint& c) { return (int64_t) c.ids.size() == branch_at; };
+                    if (ckpt_pool.on())
+                        ckpt_pool.erase_if(checks, there);
+                    else
+                        checks.erase(std::remove_if(checks.begin(), checks.end(), there), checks.end());
+                }
+            } else {
+                branch_at = req_ckpt ? strata::program::branch_checkpoint_boundary(branch_shared, read_from, turn_at, n,
+                                                                                   branch_margin)
+                                     : -1;
+            }
             if (branch_at >= 0) {
                 char from_txt[32];
                 std::snprintf(from_txt, sizeof(from_txt), branch_from >= 0 ? "slot %d's" : "the main session's",
                               branch_from);
+                char al_txt[112] = "";
+                if (al_grid > 0)
+                    std::snprintf(al_txt, sizeof(al_txt), ", aligned: it leaves at %lld, %lld-token super-chunks from %lld",
+                                  (long long) branch_shared, (long long) al_grid, (long long) al_from);
                 std::fprintf(stderr, "strata serve: branch checkpoint at %lld: the prompt leaves %s conversation there "
-                                     "(read from %lld)\n", (long long) branch_at, from_txt, (long long) read_from);
+                                     "(read from %lld%s)\n", (long long) branch_at, from_txt, (long long) read_from, al_txt);
+            } else if (al_grid > 0) {
+                std::fprintf(stderr, "strata serve: goes on from the aligned branch checkpoint at %lld: [%lld, %lld) in "
+                                     "%lld-token super-chunks from %lld\n", (long long) resume, (long long) resume,
+                             (long long) al_end, (long long) al_grid, (long long) al_from);
             }
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
             if (pin_at >= 0) cuts.push_back(pin_at);
@@ -17016,7 +17149,10 @@ int main(int argc, char** argv) {
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
-                const bool win = windows_ok(at, to);
+                // STRATA_BRANCH_CHECKPOINT_ALIGN: a part of the aligned segment goes through the walk in the segment's
+                // super-chunk (even under two chunks, never through the windows), as the read of the whole segment would
+                const bool al_part = al_grid > 0 && at >= al_from && to <= al_end;
+                const bool win = !al_part && windows_ok(at, to);
                 if (win && !keep_loan && !refill(err)) {   // (STRATA_KEEP_LOAN_MS: the windows run the lent experts on the CPU)
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
@@ -17033,7 +17169,21 @@ int main(int argc, char** argv) {
                 const int64_t read_to = merge_at >= 0 ? merge_at : to;   // (merge_at > at: the part's windows before it)
                 const auto tsp = Clock::now();
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
+                if (al_part) sp.pin_super_chunk(al_grid);
                 const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
+                if (al_part) {
+                    sp.pin_super_chunk(0);
+                    const int64_t T = std::max<int64_t>(sp.chunk(), 1);
+                    const int64_t want_s = std::min<int64_t>(al_grid, (to - at + T - 1) / T * T);
+                    if (sp_ok && sp.last_super_chunk() != want_s) {
+                        al_exact = false;
+                        std::fprintf(stderr, "strata serve: STRATA_BRANCH_CHECKPOINT_ALIGN: [%lld, %lld) was read %s%lld, "
+                                             "not in %lld-token super-chunks: this read is not the unaligned one bit for "
+                                             "bit\n", (long long) at, (long long) to,
+                                     sp.last_super_chunk() > 0 ? "in super-chunks of " : "chunk-major ",
+                                     (long long) sp.last_super_chunk(), (long long) want_s);
+                    }
+                }
                 if (sp_ok) pp_exact = true;
                 if (trace) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsp).count();
@@ -17084,7 +17234,13 @@ int main(int argc, char** argv) {
                 }
                 if (to == branch_at)   // marked: a slot that takes this conversation keeps it (slot_checkpoint_picks)
                     for (ConvCheckpoint& k : checks)
-                        if ((int64_t) k.ids.size() == branch_at) k.branch = true;
+                        if ((int64_t) k.ids.size() == branch_at) {
+                            k.branch = true;
+                            if (al_grid > 0) {   // (-1: the read did not run as planned, so no read goes on from it)
+                                k.branch_anchor = al_exact ? al_from : -1;
+                                k.branch_grid = al_grid;
+                            }
+                        }
                 if (to == pin_at && !pin_checkpoint(pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
                 if (trace && to == message_at)
