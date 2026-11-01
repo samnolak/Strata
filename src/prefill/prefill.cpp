@@ -3768,7 +3768,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         continue;
                     }
                     const uint8_t* b = m.src->blob_stable(l, e);
-                    if (!b) { err = "prefill: expert source has no blob"; return false; }
+                    if (!b) {   // #4695 (as lm_prefetch): no contiguous mapped blob - the source copies it itself
+                        js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
+                        continue;
+                    }
                     js.push_back({b, (size_t) lay0.blob_bytes(l)});
                 }
                 m.stager->finish();   // (the previous layer's MoE half finished its jobs; a layer without one did not)
@@ -5276,12 +5279,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             for (int32_t e = 0; e < m.g->n_expert; ++e)
                                 if (m.cnt[(size_t) e] == 0 && walk_job[(size_t) e] >= 0) m.stager->skip(walk_job[(size_t) e]);
-                            if (m.warmer) {
+                            if (m.warmer) {   // (as the branch below: this layer's list, and the next layer's from before)
                                 std::vector<int64_t> cur;
                                 for (size_t j = 0; j < order.size(); ++j)
                                     if (job_of[j] >= 0) cur.push_back(order[j]);
                                 m.warm_prev[(size_t) l] = cur;
                                 m.warmer->submit(l, std::move(cur));
+                                if (l + 1 < m.g->n_layers) {
+                                    std::vector<int64_t> nxt;
+                                    for (int64_t e : m.warm_prev[(size_t) (l + 1)]) {
+                                        if (m.host_res && m.cache && m.host_res[(size_t) (l + 1) * m.g->n_expert + e] >= 0)
+                                            continue;
+                                        if (m.src->pinned(l + 1, (int32_t) e)) continue;
+                                        nxt.push_back(e);
+                                    }
+                                    m.warmer->submit(l + 1, std::move(nxt));
+                                }
                             }
                         } else if (!stream_all) {
                             std::vector<Stager::Job> js;

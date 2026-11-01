@@ -14229,7 +14229,9 @@ int main(int argc, char** argv) {
                             R.buf[r] = nullptr;
                             return fail("STRATA_REFILL_PAR: no page-locked RAM for the refill buffers");
                         }
-                        if (R.ev[r] == nullptr && cudaEventCreateWithFlags(&R.ev[r], cudaEventDisableTiming) != cudaSuccess) {
+                        // blocking-sync: a thread waiting for its buffer sleeps instead of spinning (up to 16 per stage)
+                        if (R.ev[r] == nullptr &&
+                            cudaEventCreateWithFlags(&R.ev[r], cudaEventDisableTiming | cudaEventBlockingSync) != cudaSuccess) {
                             (void) cudaGetLastError();
                             R.ev[r] = nullptr;
                             return fail("STRATA_REFILL_PAR: cudaEventCreate");
@@ -14279,8 +14281,21 @@ int main(int argc, char** argv) {
                 std::string pe;
                 par_done = refill_par_run(pe);
                 if (!par_done) {
-                    // the serial refill below writes the same bytes into the same slots: a slot done twice is harmless
+                    // the serial refill below writes the same bytes into the same slots: a slot done twice is harmless.
+                    // The rings go back (every worker synchronized its stream before the run returned): page-locked RAM
+                    // is page cache the file tier no longer has.
                     refill_par_off = true;
+                    for (ParRing& R : par_rings) {
+                        const strata::core::OnDevice on(R.dev);
+                        for (int r = 0; r < kParRing; ++r) {
+                            if (R.ev[r] != nullptr) (void) cudaEventDestroy(R.ev[r]);
+                            if (R.buf[r] != nullptr) (void) cudaFreeHost(R.buf[r]);
+                            R.ev[r] = nullptr;
+                            R.buf[r] = nullptr;
+                        }
+                        R.ok = false;
+                    }
+                    (void) cudaGetLastError();
                     std::fprintf(stderr, "strata batch: WARNING: STRATA_REFILL_PAR=%d failed (%s); the lent slots are "
                                          "refilled serially from now on\n", refill_par, pe.c_str());
                     std::fflush(stderr);
