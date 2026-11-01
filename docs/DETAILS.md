@@ -1043,6 +1043,7 @@ them on your own card.
 | `--pool-affinity measure` | Hybrid CPUs, native packs | Times the `all` and `p-cores` layouts at start (about a second) and takes the faster. The measurement is taken once; where the E-cores' speed changes while the engine runs, `--pool-affinity p-cores` is the steady choice. | |
 | `STRATA_KEEP_EMPTY_TURNS=1`, `STRATA_TOPK_STREAM=0` | | See [TROUBLESHOOTING.md](TROUBLESHOOTING.md). | |
 | HIP `STRATA_DENSE_MMQ=1`, `STRATA_HIP_ADAPT_KERNEL_COPY=1` | HIP | See [AMD_HIP.md](AMD_HIP.md#model-and-serving-configuration). | |
+| `STRATA_DENSE_MMQ=1` (`STRATA_DENSE_MMQ_MIN_T=N`) | CUDA, native GGUF dense projections (Q8_0 in the UD-Q*_K_XL packs) | The prompt path's dense projections with K a multiple of 256 run as llama.cpp's int8 MMQ (activations rounded to q8_1) instead of dequantize-to-FP16 + cuBLAS; with `_MIN_T` only products of N rows or more. Not the FP16 path's bits: check KL before use. | Untested on GPU here (E22 estimate on 4x RTX 4080, UD-Q6_K_XL: long reads +5-12%). |
 
 ### CUDA opt-in kernels (sm_80 and newer)
 

@@ -404,6 +404,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)
   add_test(NAME share_rules_test COMMAND share_rules_test)
+  # STRATA_DENSE_MMQ's rules (dense_mmq_rules.hpp): which dense projections take MMQ and in how many row passes
+  add_executable(dense_mmq_rules_test tests/prefill/dense_mmq_rules_test.cpp)
+  target_include_directories(dense_mmq_rules_test PRIVATE include)
+  add_test(NAME dense_mmq_rules_test COMMAND dense_mmq_rules_test)
 
   # the Windows HIP auto prefill chunk cap (#1630) and the commit-limit verdict (#1607): header-only, no GPU
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)

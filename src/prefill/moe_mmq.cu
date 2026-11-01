@@ -224,7 +224,8 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
     if (i < n) dst[i] = (int32_t) i;
 }
 
-#if defined(__HIPCC__)   // #820: only the HIP dense-MMQ path (Gemm::native_mmq) uses these two
+// #820: only the dense-MMQ path (Gemm::native_mmq, STRATA_DENSE_MMQ) uses these two - HIP, and CUDA since E22 (two
+// one-line kernels in the EAGER-loaded module)
 __global__ void f16_to_f32_kernel(const uint16_t* __restrict__ x, float* __restrict__ y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __half2float(__ushort_as_half(x[i]));
@@ -234,8 +235,6 @@ __global__ void set_bounds_kernel(int32_t* d, int32_t rows) {
     d[0] = 0;
     d[1] = rows;
 }
-
-#endif
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
@@ -757,7 +756,7 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     ck(cudaGetLastError(), "iota");
 }
 
-#if defined(__HIPCC__)
+// (#820: HIP only before E22's CUDA STRATA_DENSE_MMQ)
 void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
     f16_to_f32_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
@@ -768,6 +767,5 @@ void set_bounds(int32_t* dst, int32_t rows, void* stream) {
     set_bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(dst, rows);
     ck(cudaGetLastError(), "set_bounds");
 }
-#endif
 
 }  // namespace strata::prefill::mmq
