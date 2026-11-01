@@ -1,6 +1,7 @@
 // The default CPU share is not armed when every expert is resident (#1595): no GPU, no model.
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #include "strata/prefill/share_rules.hpp"
 
@@ -51,6 +52,45 @@ int main() {
     CHECK(default_share_memory_verdict(m).arm);
     m.avail_ram = kUnknown; m.inplace_bytes = 500 * G;
     CHECK(default_share_memory_verdict(m).arm);                                   // RAM unknown: never blocks
+    // STRATA_BATCH_CPU_SHARE: the prompt paths' pool with batch slots
+    static_assert(prompt_paths_get_pool(0, false, false), "no batch: the pool, as before");
+    static_assert(!prompt_paths_get_pool(8, false, false), "batch slots, variable unset: no pool (the old rule, byte-identical)");
+    static_assert(prompt_paths_get_pool(8, true, false), "batch slots, STRATA_BATCH_CPU_SHARE=1: the pool");
+    static_assert(!prompt_paths_get_pool(8, true, true), "--no-pool: never");
+    static_assert(!prompt_paths_get_pool(0, false, true), "--no-pool: never");
+    // STRATA_PREFILL_CPU_SHARE_TOKENS
+    CHECK(share_token_cap(nullptr, 8) == 8);
+    CHECK(share_token_cap("", 8) == 8);
+    CHECK(share_token_cap("junk", 8) == 8);
+    CHECK(share_token_cap("0", 8) == 8);
+    CHECK(share_token_cap("-5", 8) == 8);
+    CHECK(share_token_cap("24", 8) == 24);
+    CHECK(share_token_cap("4", 8) == 4);
+    CHECK(share_token_cap("100000", 8) == 512);
+    // the jobs of one CPU expert: pieces of at most MAXT rows, in order, covering every row once
+    for (int maxt : {1, 8, 16}) {
+        for (int32_t n = 0; n <= 70; ++n) {
+            std::vector<int> seen((size_t) n, 0);
+            int32_t next = 0;
+            bool ordered = true, sized = true;
+            const int jobs = for_each_share_job(n, maxt, [&](int32_t r0, int32_t nt) {
+                ordered &= r0 == next;
+                sized &= nt >= 1 && nt <= maxt;
+                for (int32_t r = r0; r < r0 + nt && r < n; ++r) ++seen[(size_t) r];
+                next = r0 + nt;
+            });
+            CHECK(ordered);
+            CHECK(sized);
+            CHECK(next == n);
+            CHECK(jobs == (n + maxt - 1) / maxt);
+            for (int c : seen) CHECK(c == 1);
+        }
+    }
+    {   // up to MAXT tokens: exactly the old single job
+        int calls = 0;
+        for_each_share_job(8, 8, [&](int32_t r0, int32_t nt) { CHECK(r0 == 0); CHECK(nt == 8); ++calls; });
+        CHECK(calls == 1);
+    }
     if (failed == 0) std::printf("share_rules_test: ok\n");
     return failed ? 1 : 0;
 }

@@ -2960,6 +2960,20 @@ static bool prepare_gated_window(strata::core::gated::Packet& packet,
     return true;
 }
 
+// STRATA_BATCH_CPU_SHARE=1 (opt-in; unset or 0: the batch slots keep the CPU pool to themselves, as before): a prompt read
+// with --batch - an admission's, every slot drained, the decode pool idle - hands the pool its CPU share of the experts
+// the cards would stream (STRATA_PREFILL_CPU_SHARE=auto|x, with STRATA_PREFILL_CPU_SHARE_MAX and _TOKENS), on a layer split
+// too (one stage at a time takes it, prefill.cpp).  A read on a thread of its own beside decoding slots
+// (STRATA_PIPED_CONCURRENT, STRATA_BATCH_CONCURRENT_READ) takes none: their windows run the pool then
+// (Prefill::CpuShareSuspend).  The CPU's rows are not the GPU's bits (mean KL ~0.004 where the share was measured).
+static bool batch_cpu_share_env() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_BATCH_CPU_SHARE");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -9549,7 +9563,21 @@ int main(int argc, char** argv) {
             }
         }
 #endif
-        const bool share_pool = o.batch <= 0 && !o.no_pool;
+        const bool share_pool = strata::prefill::share_rules::prompt_paths_get_pool(o.batch, batch_cpu_share_env(), o.no_pool);
+        if (o.batch > 0 && batch_cpu_share_env()) {
+            const char* sv = std::getenv("STRATA_PREFILL_CPU_SHARE");
+            if (o.no_pool)
+                std::fprintf(stderr, "strata serve: STRATA_BATCH_CPU_SHARE=1 does nothing with --no-pool (no CPU pool)\n");
+            else if (sv == nullptr || std::strcmp(sv, "0") == 0)
+                std::fprintf(stderr, "strata serve: STRATA_BATCH_CPU_SHARE=1 gives the batch admissions' prompt reads the CPU "
+                                     "pool, but STRATA_PREFILL_CPU_SHARE is %s, so no expert goes to it (set it to auto)\n",
+                             sv == nullptr ? "unset" : "0");
+            else
+                std::fprintf(stderr, "strata serve: STRATA_BATCH_CPU_SHARE=1: the batch admissions' prompt reads hand the CPU "
+                                     "pool its share (STRATA_PREFILL_CPU_SHARE=%s, experts of up to %d tokens, chunks below "
+                                     "STRATA_PREFILL_CPU_SHARE_MAX); none while a read runs beside decoding slots\n",
+                             sv, strata::prefill::Prefill::cpu_share_token_cap());
+        }
         bool share_has_work = strata::prefill::share_rules::default_share_has_work(
             (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
         if (!share_has_work)
@@ -16156,6 +16184,8 @@ int main(int argc, char** argv) {
                     std::atomic<bool> done{false};
                     bool read_ok = false;
                     in_prompt_read = true;
+                    // the slots' windows run the CPU pool meanwhile: no CPU share for this read (STRATA_BATCH_CPU_SHARE)
+                    const strata::prefill::Prefill::CpuShareSuspend no_cpu_share;
                     std::thread reader([&] {
                         try {   // (an exception leaving a std::thread ends the process: a failed read instead)
                             read_ok = run(q, r);
@@ -16435,6 +16465,16 @@ int main(int argc, char** argv) {
                         std::string read_err;
                         in_prompt_read = true;
                         sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
+                        // the slots' windows run the CPU pool meanwhile: no CPU share for this read (STRATA_BATCH_CPU_SHARE)
+                        const strata::prefill::Prefill::CpuShareSuspend no_cpu_share;
+                        if (batch_cpu_share_env()) {
+                            static bool said = false;
+                            if (!said) {
+                                said = true;
+                                std::fprintf(stderr, "strata batch: STRATA_BATCH_CPU_SHARE: a prompt read on a thread of its own "
+                                                     "beside decoding slots takes no CPU share (the windows run the pool)\n");
+                            }
+                        }
                         std::thread reader([&] {
                             conc_thread_cpus();
                             try {   // (an exception leaving a std::thread ends the process: a failed read instead)

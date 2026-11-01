@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <string>
 
@@ -57,6 +58,34 @@ inline ShareVerdict default_share_memory_verdict(const ShareMemory& m) {
     }
     if (!v.arm) v.why = buf;
     return v;
+}
+
+// ---- batch slots (STRATA_BATCH_CPU_SHARE, p55/cpushare) ----
+// With --batch the slots' windows run their CPU experts on the decode pool, so the prompt paths got no pool (no share).
+// A batch admission's prompt read runs with every slot drained: STRATA_BATCH_CPU_SHARE=1 hands them the pool then.
+// Unset, the rule is the old one exactly (batch slots: no pool for the prompt paths).
+constexpr bool prompt_paths_get_pool(int64_t batch_slots, bool batch_share_env, bool no_pool) {
+    return (batch_slots <= 0 || batch_share_env) && !no_pool;
+}
+
+/// STRATA_PREFILL_CPU_SHARE_TOKENS: the most tokens of a chunk an expert may have and still go to the CPU (unset, empty,
+/// junk or <= 0: `maxt`, the pool's multi-token job - the old rule; at most 512).
+inline int share_token_cap(const char* env, int maxt) {
+    if (env == nullptr || *env == '\0') return maxt;
+    char* end = nullptr;
+    const long v = std::strtol(env, &end, 10);
+    if (end == env || v <= 0) return maxt;
+    return v > 512 ? 512 : (int) v;
+}
+
+/// An expert with `tokens` rows on the CPU runs as jobs of at most `maxt` tokens on the same blob: `f(first_row, rows)`
+/// once per job, in row order.  tokens <= maxt: one job, the whole expert (the old job exactly).
+template <class F>
+inline int for_each_share_job(int32_t tokens, int maxt, F&& f) {
+    if (maxt <= 0) maxt = 1;
+    int jobs = 0;
+    for (int32_t r0 = 0; r0 < tokens; r0 += maxt, ++jobs) f(r0, tokens - r0 < maxt ? tokens - r0 : (int32_t) maxt);
+    return jobs;
 }
 
 }  // namespace strata::prefill::share_rules
