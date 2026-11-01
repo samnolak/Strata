@@ -113,7 +113,7 @@ decodes alone.
 
 | Switch | What it does |
 |---|---|
-| `STRATA_STAGE_COPY_PARALLEL=1` | on a layer split, capture, parked restore and slot copies run one persistent worker per stage; each worker touches only its own sessions and GPU |
+| `STRATA_STAGE_COPY_PARALLEL=1` | on a layer split, capture, parked restore and slot copies run one persistent worker per stage; each worker touches only its own sessions and GPU. With `STRATA_PARK_ASYNC=1` or `STRATA_CKPT_ASYNC=1`, logs the conflict and keeps all stage copies serial to preserve the shared async staging buffers |
 | `STRATA_STAGE_COPY_TRACE=1` | with the above: print each stage's copy duration as `strata stage copy: OPERATION stage N in X ms`; off by default, with no timing vector or clock reads when disabled |
 | `STRATA_SLOT_SHUTTLE_REUSE=1` | the host-image slot path reuses one temporary K/V image per stage and call instead of allocating one per QSA layer; every save still copies the full image |
 | `STRATA_SLOT_COPY_DIRECT=1` | an admission (and a slot's resume) copies the running state and the QSA K/V device to device, instead of through host images |

@@ -6407,7 +6407,17 @@ int main(int argc, char** argv) {
     }
     const bool stage_copy_parallel = [] {
         const char* v = std::getenv("STRATA_STAGE_COPY_PARALLEL");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        if (v == nullptr || v[0] == '\0' || v[0] == '0') return false;
+        // The async checkpoint/park paths share staging buffers across devices.
+        // Keep their existing serial behavior when either is requested.
+        for (const char* name : {"STRATA_PARK_ASYNC", "STRATA_CKPT_ASYNC"}) {
+            const char* async = std::getenv(name);
+            if (async != nullptr && async[0] == '1') {
+                std::fprintf(stderr, "strata generate: STRATA_STAGE_COPY_PARALLEL is off: %s uses shared async staging; stage copies remain serial\n", name);
+                return false;
+            }
+        }
+        return true;
     }();
     std::unique_ptr<strata::core::StagePool> stage_pool;
     if (stage_copy_parallel && !stages.empty())
