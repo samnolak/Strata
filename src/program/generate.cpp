@@ -19,6 +19,7 @@
 #include "strata/core/adapt_async_default.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/nv_defaults.hpp"
+#include "strata/kernels/kv_host_pieces.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/batch_telemetry.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -10743,7 +10744,9 @@ int main(int argc, char** argv) {
             bool ok = true;
             auto hash_dev = [&](const void* p, size_t bytes, uint64_t h) {
                 for (size_t off = 0; ok && p != nullptr && off < bytes;) {
-                    const size_t k = std::min(buf.size(), bytes - off);
+                    // (kv-lean: never across two registrations of a lazy host K/V copy - kv_host_pieces.hpp)
+                    const size_t k = strata::kernels::kv_host_piece_room(static_cast<const uint8_t*>(p) + off,
+                                                                         std::min(buf.size(), bytes - off));
                     if (cudaMemcpy(buf.data(), static_cast<const uint8_t*>(p) + off, k, cudaMemcpyDefault) != cudaSuccess) {
                         ok = false;
                         break;
@@ -18888,7 +18891,8 @@ int main(int argc, char** argv) {
                 std::array<uint8_t, 65536> hash_buffer;
                 auto hash_dev = [&](const void* p, size_t bytes, uint64_t h) {
                     for (size_t offset = 0; hash_ok && offset < bytes;) {
-                        const size_t n = std::min(hash_buffer.size(), bytes - offset);
+                        const size_t n = strata::kernels::kv_host_piece_room(static_cast<const uint8_t*>(p) + offset,
+                                                                             std::min(hash_buffer.size(), bytes - offset));
                         // VRAM or a streamed host copy, with fixed diagnostic workspace.
                         if (cudaMemcpy(hash_buffer.data(), static_cast<const uint8_t*>(p) + offset, n, cudaMemcpyDefault) != cudaSuccess) {
                             hash_ok = false;

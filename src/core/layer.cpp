@@ -11,6 +11,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_host_pieces.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/fuse_decode.hpp"
 #include "strata/kernels/rope.hpp"
@@ -839,8 +840,11 @@ int64_t lazy_step() {   // cells per growth step, a multiple of 1024 (keeps ever
     static const int64_t v = std::max<int64_t>(1024, lazy_env("STRATA_KV_HOST_LAZY_STEP", 16384) / 1024 * 1024);
     return v;
 }
-int64_t lazy_init_cells() {
-    static const int64_t v = std::max<int64_t>(1024, lazy_env("STRATA_KV_HOST_LAZY_INIT", 16384) / 1024 * 1024);
+int64_t lazy_init_cells() {   // a whole number of steps: every registration starts and ends on a step boundary
+    static const int64_t v = [] {
+        const int64_t s = lazy_step(), i = std::max<int64_t>(1024, lazy_env("STRATA_KV_HOST_LAZY_INIT", 16384));
+        return (i + s - 1) / s * s;
+    }();
     return v;
 }
 uint64_t page_bytes() {
@@ -870,12 +874,12 @@ uint64_t lazy_floor_bytes() {
 bool lazy_grow(LazyHost& h, int64_t to_cells, std::string& why) {
     to_cells = std::min(to_cells, h.max_cells);
     if (to_cells <= h.cells) return true;
+    auto plan = [&](size_t r) {
+        return strata::kernels::kv_host_grow_plan((uintptr_t) h.run[r], (uintptr_t) h.reg_end[r], (uintptr_t) h.run_end[r],
+                                                  to_cells, (uint64_t) h.rows_per_cell * h.row_bytes[r], page_bytes());
+    };
     uint64_t need = 0;
-    for (size_t r = 0; r < h.run.size(); ++r) {
-        uint8_t* want = h.run[r] + (uint64_t) to_cells * (uint64_t) h.rows_per_cell * h.row_bytes[r];
-        uint8_t* end = std::min(align_ptr_up(want, page_bytes()), h.run_end[r]);
-        if (end > h.reg_end[r]) need += (uint64_t) (end - h.reg_end[r]);
-    }
+    for (size_t r = 0; r < h.run.size(); ++r) need += (uint64_t) (plan(r).to - plan(r).from);
     if (const uint64_t avail = mem_available_bytes(); avail > 0 && avail < need + lazy_floor_bytes()) {
         why = "pinning " + std::to_string(need >> 20) + " MiB more would leave less than the " +
               std::to_string(lazy_floor_bytes() >> 20) + " MiB floor of available RAM (" + std::to_string(avail >> 20) +
@@ -884,8 +888,8 @@ bool lazy_grow(LazyHost& h, int64_t to_cells, std::string& why) {
     }
     uint64_t added = 0;
     for (size_t r = 0; r < h.run.size(); ++r) {
-        uint8_t* want = h.run[r] + (uint64_t) to_cells * (uint64_t) h.rows_per_cell * h.row_bytes[r];
-        uint8_t* end = std::min(align_ptr_up(want, page_bytes()), h.run_end[r]);
+        const strata::kernels::KvHostGrow gp = plan(r);
+        uint8_t* end = (uint8_t*) gp.to;
         if (end <= h.reg_end[r]) continue;
         const size_t len = (size_t) (end - h.reg_end[r]);
         const cudaError_t e = cudaHostRegister(h.reg_end[r], len, cudaHostRegisterPortable | cudaHostRegisterMapped);
@@ -1117,6 +1121,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                 return 0;
             }
             g_kv_host_reserved += total;
+            // every registration starts and ends on a step boundary of each array: the host-K/V copies cut there
+            for (size_t r = 0; r < h->run.size(); ++r)
+                strata::kernels::kv_host_piece_record(h->run[r], h->run_end[r],
+                                                      (uint64_t) lazy_step() * (uint64_t) h->rows_per_cell * h->row_bytes[r]);
             static bool said = false;
             if (!said) {
                 said = true;
