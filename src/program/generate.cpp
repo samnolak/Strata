@@ -89,6 +89,7 @@
 #include "strata/program/par_refill.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/idle_park.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/program/stage_reserve.hpp"
 #include "strata/program/gpu_report.hpp"
@@ -10991,6 +10992,7 @@ int main(int argc, char** argv) {
             const strata::core::QsaState* draft_last;     ///< ... with the last stage's image (a split: the drafter's GPU)
             bool with_reuse;                              ///< the retained K/V describes this source (the main session's)
             std::string what;                             ///< the log's words after the token count ("", " from slot 1")
+            bool no_evict = false;                        ///< STRATA_IDLE_PARK: parked only beside what is parked (no eviction)
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
@@ -11122,6 +11124,11 @@ int main(int argc, char** argv) {
             // estimate must stay uncapped: it counts the retained buffers'
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
+            if (src.no_evict && !conversations.can_fit(estimate, held)) {   // STRATA_IDLE_PARK: never at another's expense
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking%s (%zu MiB do not fit beside the %zu parked "
+                                     "without an eviction)\n", src.what.c_str(), estimate >> 20, conversations.size());
+                return true;
+            }
             if (!conversations.make_room(estimate, held)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
@@ -11149,7 +11156,7 @@ int main(int argc, char** argv) {
                     return strata::core::conversation_memory_admit(
                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                 };
-                while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
+                while (!admit() && !src.no_evict && conversations.size() > 0 && evicted < conversations.slots() &&
                        conversations.evict_oldest())
                     ++evicted;
                 if (!admit()) {
@@ -13282,7 +13289,9 @@ int main(int argc, char** argv) {
         // Parking is an optimization like a checkpoint (#3350): a skip and a failed snapshot (a host or device
         // allocation that ran out) are logged and the slot is overwritten as before.  Nothing here ends the request
         // or the engine.
-        auto park_slot = [&](int b) {
+        // `idle` (STRATA_IDLE_PARK): parked while the engine idles, ahead of the admission that would overwrite the slot -
+        // only beside what is parked already (no eviction); the admission then finds it held and parks nothing
+        auto park_slot = [&](int b, bool idle = false) {
             BSlot& sl = bs[(size_t) b];
             if (!conversations.enabled() || sl.active || !sl.cached || sl.img || sl.ids.empty()) return;
             auto prefix_of = [&](const std::vector<int32_t>& whole) {
@@ -13319,7 +13328,7 @@ int main(int argc, char** argv) {
             ParkSource src{sl.ids, no_imgs, sl.checks, sl.cvec, *bslot_ss[0][(size_t) b], {},
                            (n_st > 0 && !mtp_first) || !batch_mtp ? nullptr : &slot_mtp[(size_t) b]->kv_state(),
                            batch_mtp && !mtp_first && n_st > 0 ? &slot_mtp[(size_t) b]->kv_state() : nullptr, false,
-                           " from slot " + std::to_string(b)};
+                           " from slot " + std::to_string(b) + (idle ? " (idle)" : ""), idle};
             for (size_t k = 1; k < bslot_ss.size(); ++k) src.stage_sessions.push_back(bslot_ss[k][(size_t) b].get());
             try {
                 if (park_source(src, 0)) return;
@@ -14430,6 +14439,46 @@ int main(int argc, char** argv) {
                          srcp != &src ? " - but the expert source here is not the file-backed one (serial refill)"
                          : refill_parts || refill_blocking() ? " - but STRATA_REFILL_PARTS / STRATA_REFILL_BLOCKING is set (serial refill)"
                          : "");
+        // STRATA_IDLE_PARK=1|2 (opt-in, idle_park.hpp; unset or 0: nothing here runs): an idle slot's conversation is parked
+        // while the engine has nothing to do (1: no slot decodes and no command waits; 2: also between batch windows), once
+        // the slot has been idle STRATA_IDLE_PARK_MS (500), oldest first, each held state once, never evicting another
+        static const int idle_park_mode = strata::program::idle_park::mode_from(std::getenv("STRATA_IDLE_PARK"));
+        static const int64_t idle_park_ms = strata::program::idle_park::min_ms_from(std::getenv("STRATA_IDLE_PARK_MS"));
+        strata::program::idle_park::Tracker idle_park;
+        int64_t idle_parks = 0;
+        const Clock::time_point idle_park_t0 = Clock::now();
+        auto idle_park_now = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - idle_park_t0).count(); };
+        // each slot's state as a key (0: not a candidate - what park_slot would refuse or skip anyway)
+        auto idle_park_scan = [&](double now) {
+            for (size_t b = 0; b < bs.size(); ++b) {
+                const BSlot& sl = bs[b];
+                const bool cand = conversations.enabled() && !sl.active && sl.cached && !sl.img && !sl.partial && !sl.tainted &&
+                                  !sl.ids.empty() && conversations.wants((int64_t) sl.ids.size()) && !(use_mtp && !batch_mtp);
+                idle_park.see(b, cand ? strata::program::idle_park::slot_key(sl.ids.size(), sl.ids.back(), sl.cvec) : 0, now);
+            }
+        };
+        if (idle_park_mode > 0 && o.batch > 0)
+            std::fprintf(stderr, "strata batch: STRATA_IDLE_PARK=%d: an idle slot's conversation is parked %s once it has been idle "
+                                 "%lld ms (never evicting a parked one)%s\n", idle_park_mode,
+                         idle_park_mode >= 2 ? "between batch windows and while nothing decodes" : "while nothing decodes and no "
+                         "command waits", (long long) idle_park_ms, conversations.enabled() ? "" : " - but the conversation "
+                         "cache is off here");
+        // one park, if one is due (true: one was tried)
+        auto idle_park_one = [&]() -> bool {
+            const double now = idle_park_now();
+            idle_park_scan(now);
+            const int b = idle_park.pick(now, (double) idle_park_ms);
+            if (b < 0) return false;
+            idle_park.tried((size_t) b);
+            const auto t0 = Clock::now();
+            park_slot(b, true);
+            ++idle_parks;
+            if (trace)
+                std::fprintf(stderr, "strata trace: idle park of slot %d (%zu tokens) took %.1f ms (%lld so far)\n", b,
+                             bs[(size_t) b].ids.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             (long long) idle_parks);
+            return true;
+        };
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -14439,6 +14488,16 @@ int main(int argc, char** argv) {
                     if (loan_kept && Clock::now() - loan_kept_at >= std::chrono::milliseconds(keep_loan_ms)) {
                         if (piped && !pipe_drain()) return 1;
                         if (!loan_give_back("no admission within the window", true)) return 1;
+                    }
+                    // STRATA_IDLE_PARK=2: between windows (the groups in flight finish first, as before an admission)
+                    if (idle_park_mode >= 2 && conversations.enabled()) {
+                        const double now = idle_park_now();
+                        idle_park_scan(now);
+                        if (idle_park.pick(now, (double) idle_park_ms) >= 0) {
+                            if (piped && !pipe_drain()) return 1;
+                            (void) idle_park_one();
+                            continue;
+                        }
                     }
                     if (!(piped ? pump(true) : batch_step())) return 1;
                     continue;
@@ -14472,6 +14531,23 @@ int main(int argc, char** argv) {
                         any = !in_lines.empty();
                     }
                     if (!any && !loan_give_back("idle", true)) return 1;
+                }
+                // STRATA_IDLE_PARK: nothing decodes - park the idle slots that are due while no command waits (a command
+                // that comes meanwhile waits for at most the park in progress)
+                while (idle_park_mode > 0 && conversations.enabled()) {
+                    bool waiting = false;
+                    {
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        waiting = !in_lines.empty() || in_eof;
+                    }
+                    if (waiting) break;
+                    if (idle_park_one()) continue;
+                    double due = -1.0;
+                    (void) idle_park.pick(idle_park_now(), (double) idle_park_ms, &due);
+                    if (due < 0.0) break;   // none will be due without a change: wait for the next command as before
+                    std::unique_lock<std::mutex> lk(in_mu);
+                    in_cv.wait_for(lk, std::chrono::duration<double, std::milli>(std::max(0.0, due - idle_park_now()) + 1.0),
+                                   [&] { return !in_lines.empty() || in_eof; });
                 }
                 if (!next_line(line)) {
                     if (!loan_give_back("end", true)) return 1;

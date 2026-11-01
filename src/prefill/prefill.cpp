@@ -2,6 +2,7 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/copy_events.hpp"
+#include "strata/prefill/stage_prefetch.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/kernels/dflash2.hpp"
 #endif
@@ -187,6 +188,24 @@ inline bool stream_ahead_enabled() {
     }();
     return on;
 }
+// STRATA_STAGE_PREFETCH=1 (opt-in, stage_prefetch.hpp; unset or 0: nothing here runs).  Read once.
+inline bool stage_prefetch_env() {
+    static const bool on = stage_prefetch::enabled_from(std::getenv("STRATA_STAGE_PREFETCH"));
+    return on;
+}
+// STRATA_PF_ROUTE_EVENT=1 (opt-in; unset or 0: as before).  The batched MoE half groups the routed (token, k) pairs by
+// expert on the host, after a cudaStreamSynchronize that waits for the router AND everything queued behind it - in the
+// streamed walk the shared expert, which was queued before the routing's readback - and the GPU then idles while the
+// host groups, uploads the tables and launches the experts (~0.2-0.5 ms a layer, E15 §3).  With the flag the readback
+// is queued right behind the router, an event behind the readback, the shared expert behind the event, and the host
+// waits for the event only: it groups while the GPU computes the shared expert.  The same kernels on the same inputs in
+// the same stream (the shared expert reads only the layer's input and writes only its own outputs; the readback reads
+// only the routed ids): the same bits.  Only with the mapped grouping tables, no CPU share and no STRATA_PREFILL_TIMING.
+inline bool pf_route_event_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_ROUTE_EVENT"); return v != nullptr && std::atoi(v) > 0; }();
+    return on;
+}
+
 // Step 3: from this chunk size on, every non-resident expert of every layer streams in a fixed order through a
 // ring_slots()-slot ring (nearly all 512 are routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
@@ -1197,6 +1216,18 @@ struct Prefill::Impl {
     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
     // `used` of the last slot gathered with it, recorded once for all of them (a later record only waits longer)
     int used_of[RING_MAX] = {};
+    // STRATA_STAGE_PREFETCH: what the stage before issued into this stage's slots for its next chunk - mode 1: the
+    // streamed walk's first entries (entry i in slot i), 2: the staged walk's first layer (its i-th staging in slot i).
+    // Written by that stage's thread while this one is idle, read when this one's run starts (the hand-off orders them).
+    struct PreIssued {
+        int mode = 0;
+        int64_t T = 0, pos0 = 0;          // the chunk they are for (this stage's first chunk of it)
+        int ring = 0;                     // the layout they went into
+        const uint8_t* slot0 = nullptr;
+        std::vector<stage_prefetch::Ent> ents;
+    } pre;
+    int64_t pre_runs = 0, pre_taken = 0, pre_dropped = 0, pre_walk_taken = 0, pre_walk_left = 0;   // (the log)
+    cudaEvent_t route_ev = nullptr;   // STRATA_PF_ROUTE_EVENT: the routing's readback is done (this device)
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -1348,6 +1379,7 @@ void Prefill::release() {
     if (impl_->ple_raw_free) (void) cudaEventDestroy(impl_->ple_raw_free);
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
+    if (impl_->route_ev) cudaEventDestroy(impl_->route_ev);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     if (impl_->lm.dev) cudaFree(impl_->lm.dev);
     if (impl_->lm.R_host) cudaFreeHost(impl_->lm.R_host);
@@ -3057,6 +3089,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t forced = hand_in_ == nullptr ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
     Impl& m = *impl_;
+    // STRATA_STAGE_PREFETCH: what the stage before issued into this stage and this run did not take is waited for and
+    // dropped when the run ends, whichever way it ends; `wait`: the staged walk's slots it did not take (their copies)
+    struct PreOwn {
+        Prefill* self;
+        bool wait = false;
+        ~PreOwn() {
+            self->stage_prefetch_drop();
+            if (wait) {
+                const core::OnDevice d(self->impl_->device);
+                cudaStreamSynchronize(self->impl_->copy);
+            }
+        }
+    } pre_own{this};
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
@@ -3215,6 +3260,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot[(size_t) tap_layers_[i]] = (int) i;
     }
 #endif
+    // STRATA_STAGE_PREFETCH: the staged walk's slots the stage before filled (this run's first chunk, layer LB), and what
+    // this stage issued into the next one and has not handed it yet (dropped - waited for - if the run ends first)
+    stage_prefetch::WalkCursor walk_pre;
+    struct PreNext {
+        Prefill* next;
+        bool armed = false;
+        ~PreNext() { if (armed) next->stage_prefetch_drop(); }
+    } pre_next{next_};
     for (int64_t c0 = 0; c0 < n; c0 += C) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
@@ -3657,6 +3710,42 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::vector<std::atomic<int64_t>> rec_of(sparse_copied ? (size_t) m.ring : 0);   // the entry a slot's event marks
         for (auto& r : rec_of) r.store(-1, std::memory_order_relaxed);
         std::atomic<size_t> a_rec{0};   // 1 + the last entry whose copied event is recorded
+        // STRATA_STAGE_PREFETCH: the copies the stage before issued into this stage's slots for this chunk - taken when
+        // they are exactly this stream's first entries (the streamed walk) or armed for layer LB's stagings (the staged
+        // walk); anything else is waited for and dropped, and this stage issues everything itself, as without the flag
+        size_t pre_n = 0;
+        if (m.pre.mode != 0 && c0 == 0) {
+            const bool same = m.pre.T == T && m.pre.pos0 == p0 && m.pre.ring == m.ring && m.pre.slot0 == m.stage_dev[0];
+            if (m.pre.mode == 1 && same && stream_all && !sparse_copied && !ps_on) {
+                std::vector<stage_prefetch::Ent> head;
+                const size_t k = std::min(m.pre.ents.size(), seq.size());
+                head.reserve(k);
+                for (size_t i = 0; i < k; ++i) head.push_back({seq[i].l, seq[i].e, seq[i].blob, seq[i].job < 0});
+                if (stage_prefetch::prefix_matches(m.pre.ents.data(), m.pre.ents.size(), head.data(), head.size()))
+                    pre_n = m.pre.ents.size();
+            } else if (m.pre.mode == 2 && same && !stream_all && !walk_pf && !m.pp) {
+                walk_pre.arm(std::move(m.pre.ents));
+                pre_own.wait = walk_pre.live;
+            }
+            if (pre_n > 0 || walk_pre.live) {
+                if (std::getenv("STRATA_TRACE"))
+                    std::fprintf(stderr, "strata trace: stage [%lld,%lld) chunk from token %lld: %zu expert copies issued "
+                                         "ahead by the stage before (%s, STRATA_STAGE_PREFETCH)\n", (long long) LB,
+                                 (long long) LE, (long long) p0, pre_n > 0 ? pre_n : walk_pre.ents.size(),
+                                 pre_n > 0 ? "the streamed walk's first entries, taken" : "the staged walk's first layer, armed");
+                m.pre.mode = 0;
+                m.pre.ents.clear();
+                if (pre_n > 0) {
+                    stats_.experts_streamed += (int64_t) pre_n;
+                    stats_.experts_dma += (int64_t) pre_n;
+                    m.pre_taken += (int64_t) pre_n;
+                    issued = pre_n;
+                    a_issued.store(pre_n, std::memory_order_release);
+                }
+            } else {
+                stage_prefetch_drop();
+            }
+        }
         int64_t iss_waits = 0, iss_dedup = 0;
         if (threaded_issue) {
             issuer = std::thread([&] {
@@ -3673,7 +3762,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 };
                 // before the issuer waits: what it issued is covered, so no consumer waits on an entry with no event
                 auto cover = [&](size_t idx) { if (sparse_copied && idx > 0 && last_rec < (int64_t) idx - 1) record(idx - 1); };
-                for (size_t idx = 0; idx < seq.size(); ++idx) {
+                for (size_t idx = pre_n; idx < seq.size(); ++idx) {   // (pre_n: issued by the stage before)
                     const auto tw = ssd_tr && idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring
                                         ? Clock::now() : Clock::time_point{};
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
@@ -3757,6 +3846,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             cudaSetDevice(m.pp->dev);
             p_issue_until((size_t) m.pp->RP);
             cudaSetDevice(pd);
+        }
+        // STRATA_STAGE_PREFETCH: the next stage's first copies of this chunk go on its idle link now, while this stage reads
+        // the chunk (only when that stage is done with its last chunk; not when it helps this one: its slots are in use)
+        if (stage_prefetch_env() && next_ != nullptr && !helped && !pre_next.armed &&
+            (!next_run_.valid() || next_run_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)) {
+            pre_next.armed = stage_prefetch_issue(T, p0);
+            if (pre_next.armed) {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::fprintf(stderr, "strata prefill: STRATA_STAGE_PREFETCH=1: a layer split's next stage gets its first "
+                                         "expert copies of a chunk on its own link while the stage before reads it\n");
+                }
+            }
         }
         host_setup_ms += ms_since(tsetup);
         bool normed = false;   // F-2: the previous half's write already normed R for this half (grs, xn16)
@@ -4372,7 +4475,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     };
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
                     // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
-                    const bool defer_shared = !stream_all && stream_ahead_enabled();
+                    // STRATA_PF_ROUTE_EVENT (pf_route_event_env): the shared expert goes behind the routing's readback
+                    const bool route_ev = pf_route_event_env() && !pt.on && m.grp_host != nullptr && !pool_hold.held;
+                    const bool defer_shared = (!stream_all && stream_ahead_enabled()) || route_ev;
                     if (!defer_shared && !shared_expert()) return false;
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
@@ -4435,6 +4540,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (fused_l && nib_l.on) core::nibble::fatal(l, "the prompt path's fused experts", "they read GGUF blocks");
 #endif
                     if (fused_l) {
+                        // (no host grouping here: STRATA_PF_ROUTE_EVENT's deferred shared expert goes where it was)
+                        if (route_ev && !shared_expert()) return false;
                         if (static bool said = false; !said) {
                             said = true;
                             std::fprintf(stderr, "strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, "
@@ -4579,7 +4686,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // work), not the host: the watchdog's report says so (only its text changes)
                         core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
                                           l, p0);
-                        cudaStreamSynchronize(m.cs);
+                        if (route_ev) {
+                            // STRATA_PF_ROUTE_EVENT: the host waits for the readback only, the shared expert runs meanwhile
+                            if (m.route_ev == nullptr &&
+                                cudaEventCreateWithFlags(&m.route_ev, cudaEventDisableTiming) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                m.route_ev = nullptr;
+                            }
+                            if (m.route_ev != nullptr) cudaEventRecord(m.route_ev, m.cs);
+                            if (!shared_expert()) return false;
+                            if (m.route_ev != nullptr) cudaEventSynchronize(m.route_ev);
+                            else cudaStreamSynchronize(m.cs);
+                            if (static bool said = false; !said) {
+                                said = true;
+                                std::fprintf(stderr, "strata prefill: STRATA_PF_ROUTE_EVENT=1: the host groups a layer's routed "
+                                                     "tokens while the GPU computes its shared expert\n");
+                            }
+                        } else {
+                            cudaStreamSynchronize(m.cs);
+                        }
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         if (on_routes) on_routes(l, ids_h, T * K);   // 149-prefetch: the RAM policy's prompt seed
                         if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
@@ -4636,7 +4761,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
                             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
                         }
-                        if (defer_shared) {
+                        if (defer_shared && !route_ev) {
                             pt.mark(kPfRouter, cs);   // keep the existing router+shared timing attribution
                             if (!shared_expert()) return false;
                             pt.mark(kPfHostGroup, cs);
@@ -5362,6 +5487,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                             if (resident) return true;
+                            if (walk_pre.live) {   // STRATA_STAGE_PREFETCH: the stage before copied this one into this slot
+                                const bool pin = l == LB && m.src->pinned(l, e);
+                                const uint8_t* pb = pin ? m.src->blob_stable(l, e) : nullptr;
+                                if (walk_pre.take((size_t) stage_next, (int32_t) l, e, pb, pin && pb != nullptr)) {
+                                    stage_of[j] = stage_next;
+                                    stage_next = (stage_next + 1) % stage_n;
+                                    ++stats_.experts_dma;
+                                    ++stats_.experts_streamed;
+                                    ++m.pre_walk_taken;
+                                    if (ssd_tr) ++ssd_pinned;
+                                    return true;
+                                }
+                            }
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % stage_n;
                             const auto th = Clock::now();
@@ -5900,6 +6038,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
+            pre_next.armed = false;   // STRATA_STAGE_PREFETCH: what was issued into the next stage is its own run's now
             next_->hand_in_ = h;
             next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
             next_->hand_pieces_ = hp;
@@ -7420,6 +7559,95 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                      (long long) n, total, line.c_str());
     }
     return true;
+}
+
+// The next stage's first copies of the chunk [p0, p0 + T): the ones its run_impl issues first, on its copy stream, into
+// its own slots, each followed by its "copied" event - exactly as its issuer would (a slot still marked live first waits
+// for its release event, which its finished run recorded long ago).  Called by this stage's thread at the start of its
+// chunk, only while the next stage is idle; the next stage takes them or drops them (stage_prefetch_drop) when its run
+// starts.  Only page-locked blobs (a DMA); the first entry that would need the stager or another device ends the list.
+bool Prefill::stage_prefetch_issue(int64_t T, int64_t p0) {
+    if (next_ == nullptr || !next_->impl_ || !next_->tap_layers_.empty()) return false;
+    Impl& nm = *next_->impl_;
+    if (nm.pre.mode != 0 || nm.src == nullptr || nm.pp || nm.copy == nullptr || nm.device < 0 || nm.g == nullptr ||
+        nm.stage_dev[0] == nullptr || kva_config().on)
+        return false;
+    const core::ModelGeometry& g = *nm.g;
+    const int64_t nb = std::max<int64_t>(0, next_->stage_lb_), ne = next_->stage_le_ < 0 ? g.n_layers : next_->stage_le_;
+    const int64_t T1 = std::min<int64_t>(T, nm.T);   // the next stage's first chunk of it (it reads in chunks of its T)
+    if (nb >= ne || T1 <= 0) return false;
+    const int32_t NE = (int32_t) g.n_expert;
+    const bool stream_next = nm.ring > STAGE && T1 >= stream_all_min();
+    int mode = 0;
+    size_t limit = 0;
+    if (stream_next) {
+        // its streamed walk: every non-resident expert of every layer in id order, entry i in slot i % ring
+        mode = 1;
+        limit = (size_t) nm.ring;
+    } else {
+        // its staged walk, layer nb: the non-resident experts its routing picks, in id order, the i-th in slot i
+        static const int64_t walk_min = stage_prefetch::walk_min_from(std::getenv("STRATA_STAGE_PREFETCH_WALK_MIN"));
+        if (walk_min <= 0 || T1 < walk_min) return false;
+        if (walk_prefetch_env() > 0) return false;                             // the stager holds the layer's experts
+        if (next_->cpu_pool_ != nullptr && cpu_share_on()) return false;       // the CPU's share leaves the walk's order
+        static const bool group_env = [] {   // (run_impl's STRATA_PREFILL_GROUP_GATHER)
+            const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+        const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) nb];
+        const bool group_resident = group_env && use_mmq && lay.native && MMQ_GROUP <= mmq::kGatherGroupMax;
+        mode = 2;
+        limit = (size_t) (group_resident ? STAGE_GRP : STAGE);
+    }
+    std::vector<stage_prefetch::Ent> ents;
+    ents.reserve(limit);
+    bool stop = false;
+    for (int64_t l = nb; l < (mode == 1 ? ne : nb + 1) && !stop && ents.size() < limit; ++l)
+        for (int32_t e = 0; e < NE && ents.size() < limit; ++e) {
+            if (nm.host_res && nm.cache && nm.host_res[(size_t) l * NE + e] >= 0) continue;   // resident
+            if (nm.src->transient(l, e)) { stop = true; break; }                             // the stager's
+            const bool pinned = nm.src->pinned(l, e);
+            const uint8_t* b = pinned ? nm.src->blob_stable(l, e) : nullptr;
+            if (!pinned || b == nullptr) { stop = true; break; }
+            ents.push_back({(int32_t) l, e, b, true});
+        }
+    if (ents.empty()) return false;
+    const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
+    const core::OnDevice on(nm.device);
+    for (size_t i = 0; i < ents.size(); ++i) {
+        const int sl = (int) i;
+        if (nm.stage_live[sl]) cudaStreamWaitEvent(nm.copy, nm.used[nm.used_of[sl]], 0);
+        cudaMemcpyAsync(nm.stage_dev[sl], ents[i].blob, (size_t) lay0.blob_bytes(ents[i].l), cudaMemcpyHostToDevice, nm.copy);
+        cudaEventRecord(nm.copied[sl], nm.copy);
+        nm.stage_live[sl] = true;
+    }
+    if (cudaPeekAtLastError() != cudaSuccess) {   // nothing half-issued is left to the next stage
+        (void) cudaGetLastError();
+        cudaStreamSynchronize(nm.copy);
+        return false;
+    }
+    nm.pre.mode = mode;
+    nm.pre.T = T1;
+    nm.pre.pos0 = p0;
+    nm.pre.ring = nm.ring;
+    nm.pre.slot0 = nm.stage_dev[0];
+    nm.pre.ents = std::move(ents);
+    ++nm.pre_runs;
+    return true;
+}
+
+// What the stage before issued into this stage and nobody took: its copies may still be landing in the slots, which are
+// cache slots again once the prompt's loan ends - so they are waited for before anything else can happen to them.
+void Prefill::stage_prefetch_drop() {
+    if (!impl_) return;
+    Impl& m = *impl_;
+    if (m.pre.mode == 0) return;
+    const core::OnDevice on(m.device);
+    cudaStreamSynchronize(m.copy);
+    m.pre.mode = 0;
+    m.pre.ents.clear();
+    ++m.pre_dropped;
 }
 
 bool Prefill::drain_pipeline(std::string& err) {

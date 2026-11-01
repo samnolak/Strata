@@ -383,6 +383,17 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(split_rules_test PRIVATE include)
   add_test(NAME split_rules_test COMMAND split_rules_test)
 
+  # STRATA_STAGE_PREFETCH's rules: what a stage issues ahead into the next stage's slots and when that stage takes it
+  # (header-only, no GPU)
+  add_executable(stage_prefetch_test tests/prefill/stage_prefetch_test.cpp)
+  target_include_directories(stage_prefetch_test PRIVATE include)
+  add_test(NAME stage_prefetch_test COMMAND stage_prefetch_test)
+
+  # STRATA_IDLE_PARK's rules: which idle batch slot is parked when (header-only, no GPU)
+  add_executable(idle_park_test tests/program/idle_park_test.cpp)
+  target_include_directories(idle_park_test PRIVATE include)
+  add_test(NAME idle_park_test COMMAND idle_park_test)
+
   # #3797: the out-of-memory report at start (per card free/total, the largest other programs): the text is a pure
   # function; the driver query (NVML, loaded at run time) is only checked to be safe to call. No GPU needed.
   add_executable(gpu_report_test tests/program/gpu_report_test.cpp)

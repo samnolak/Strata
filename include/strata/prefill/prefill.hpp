@@ -320,6 +320,11 @@ private:
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
+    // STRATA_STAGE_PREFETCH (stage_prefetch.hpp): this stage issues the next one's first expert copies of the chunk
+    // [p0, p0 + T) while that stage is idle (true: something was issued), and a stage drops what was issued into it
+    // without being taken (it waits for those copies first)
+    bool stage_prefetch_issue(int64_t T, int64_t p0);
+    void stage_prefetch_drop();
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     std::vector<int> tap_layers_;
