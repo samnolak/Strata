@@ -303,7 +303,19 @@ public:
     /// lm_prepare_chain sizes it when VRAM is no limit (lm_plan.hpp); 0 when the walk is off or would not take n tokens.
     /// The walk's other conditions (pictures, KVA, a --prefill-pipe plan, ...) are not checked: last_super_chunk() tells
     /// what a run did.
-    int64_t lm_plan_super_chunk(int64_t n) const;
+    int64_t lm_plan_super_chunk(int64_t n, int64_t chunk = 0) const;
+    /// STRATA_BRANCH_CHECKPOINT_ALIGN: the super-chunk run() would read an n-token run in NOW (the walk's gate, every
+    /// stage's lm_prepare with this VRAM, the even split; with `pin` > 0 the pinned size), its buffers released again;
+    /// 0 when the walk would not take it (`why`).  Called after lend(), so the buffers' chunk is the run's.
+    int64_t lm_probe(int64_t n, int64_t pin, std::string& why);
+    /// pin_super_chunk for a scope (reset on every way out)
+    struct PinScope {
+        Prefill& p;
+        PinScope(Prefill& q, int64_t s) : p(q) { p.pin_super_chunk(s); }
+        ~PinScope() { p.pin_super_chunk(0); }
+        PinScope(const PinScope&) = delete;
+        PinScope& operator=(const PinScope&) = delete;
+    };
     /// The next runs' super-chunk, on the chain's first stage (0: off, as before): every stage's walk takes min(s, the run
     /// rounded up to whole chunks) - even for a run under two chunks, and without the even split.  A run that cannot take
     /// it (VRAM, another condition of the walk) is read chunk-major as before; last_super_chunk() then says 0.

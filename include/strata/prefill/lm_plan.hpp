@@ -22,4 +22,22 @@ inline int64_t lm_super_chunk(int64_t n, int64_t want, int64_t chunk, int64_t mi
     return (even && k >= 2 && ev < s) ? ev : s;
 }
 
+/// The walk's knobs as lm_prepare reads them (prefill.cpp): STRATA_PREFILL_LM_TOKENS (`tokens`, 0: unset),
+/// STRATA_PREFILL_LM_FORCE (`force`), whether STRATA_PREFILL_LAYER_MAJOR was set (`explicit_on`: the 8192 target, else
+/// the on-by-default 32768) and STRATA_PREFILL_LM_EVEN (`even`).
+struct LmKnobs {
+    int64_t tokens = 0;
+    bool force = false, explicit_on = false, even = true;
+};
+inline constexpr int64_t kLmPlanDefaultTokens = 8192;     // = prefill.cpp kLmDefaultTokens
+inline constexpr int64_t kLmPlanDefaultOnTokens = 32768;  // = prefill.cpp kLmDefaultOnTokens
+/// STRATA_BRANCH_CHECKPOINT_ALIGN: the super-chunk an n-token run takes in chunks of `chunk` tokens (the chunk the
+/// run's loan lays the buffers out for - Prefill::chunk() after lend(), not before it), VRAM aside.
+inline int64_t lm_plan_grid(int64_t n, int64_t chunk, const LmKnobs& k) {
+    if (chunk <= 0) return 0;
+    const int64_t min_s = k.force ? 1 : (k.tokens > 0 ? chunk : 2 * chunk);
+    const int64_t want = k.tokens > 0 ? k.tokens : (!k.explicit_on ? kLmPlanDefaultOnTokens : kLmPlanDefaultTokens);
+    return lm_super_chunk(n, want, chunk, min_s, k.even);
+}
+
 }  // namespace strata::prefill

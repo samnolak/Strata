@@ -526,6 +526,16 @@ A request that cannot read that way (pieces, `pin=`, pictures, co-read, a messag
 not read in the pinned size (VRAM) is logged (`STRATA_BRANCH_CHECKPOINT_ALIGN: [a, b) was read ...`) and its checkpoint
 is not continued from. CPU test: `tests/program/branch_align_test.cpp`.
 
+What else the switch holds to (round 2): an aligned part lends for its whole segment (`lend(al_end - al_from)`: the
+buffers' chunk and the experts read in place are those of the segment's read in one run, not of the short part), the
+grid is computed in that chunk, and before the first aligned part the walk is asked what it takes for the segment now
+(`Prefill::lm_probe`: VRAM, every stage, every condition of the walk) - a cut not made yet is dropped when that is not
+the grid, so a read that cannot be pinned is read in one run instead. A request that goes on from a checkpoint is
+matched to the object it restored (a slot's checkpoint copied back included). Periodic marks
+(`--prompt-cache-every`, the near-tail one) are tagged with their segment's anchor and grid when they lie on it; an
+aligned read goes on from a mark only under the same rule as from a branch checkpoint (a request off the aligned way
+uses them as before).
+
 ### Server: placement by what the slots hold (`STRATA_SLOT_CACHE_AFFINITY=1`)
 
 With `"env": {"STRATA_SLOT_CACHE_AFFINITY": "1"}` in the server config and pipelined groups, `pick_slot` asks the

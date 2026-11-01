@@ -101,6 +101,52 @@ inline bool aligned_resume_ok(int64_t at, int64_t anchor, int64_t grid, int64_t 
     return anchor >= 0 && grid > 0 && at > anchor && at < seg_end && (at - anchor) % grid == 0;
 }
 
+// The read's own cuts in a prompt `ids` of n tokens read on from `from` (generate.cpp's serve loop; one function for the
+// read and for STRATA_BRANCH_CHECKPOINT_ALIGN's "what would a read from there cut"): `turn` = the last turn token past
+// `from` (#458: moved to the turn before it when that one opens with --tail-role-token), -1 with ckpt=0 or none; `root`
+// = the first turn token from position 1 on when it is at least `root_min` tokens in (--prompt-cache-root), only for a
+// read that starts at token 0 (`root_ok`) and before the last turn token.  `cache_on`: --prompt-cache > 0.
+struct TurnRoot {
+    int64_t turn = -1, root = -1;
+};
+template<class Tok>
+inline TurnRoot read_turn_root(const Tok* ids, int64_t n, int64_t from, bool root_ok, bool ckpt, bool cache_on,
+                               int64_t turn_token, int64_t tail_role_token, int64_t root_min) {
+    TurnRoot r;
+    if (cache_on && turn_token >= 0)
+        for (int64_t i = n - 1; i > from; --i)
+            if ((int64_t) ids[i] == turn_token) { r.turn = i; break; }
+    if (r.turn > 0 && tail_role_token >= 0)
+        for (int64_t i = r.turn - 1; i > from; --i)
+            if ((int64_t) ids[i] == turn_token) {
+                if ((int64_t) ids[i + 1] == tail_role_token) r.turn = i;
+                break;
+            }
+    const int64_t last_turn = r.turn;   // ckpt=0 drops the split there, the root is still looked for before it
+    if (!ckpt) r.turn = -1;
+    if (cache_on && turn_token >= 0 && root_min > 0 && root_ok)
+        for (int64_t i = 1; i < last_turn; ++i)
+            if ((int64_t) ids[i] == turn_token) {
+                if (i >= root_min) r.root = i;
+                break;
+            }
+    return r;
+}
+
+// STRATA_BRANCH_CHECKPOINT_ALIGN: may a read go on from a checkpoint at `at` taken on the grid `ck_grid` of a read from
+// `anchor` (a branch checkpoint, or a periodic mark inside such a segment)?  `end_from_anchor` / `end_from_at`: the end of
+// the segment holding `at` in a read of THIS prompt from the anchor / from `at` (the first of that read's own cuts past
+// at: its turn boundary, root, last token), `first_cut_from_anchor` the first cut of the read from the anchor past the
+// anchor, `grid_now` the super-chunk that read takes for [anchor, end_from_anchor).  Yes only when that read reads
+// [anchor, end) as one segment (no cut of its own in (anchor, at]), ending where the read from `at` ends, on the same
+// grid as the checkpoint's, and `at` lies on it: then the rest, read in that grid, gives the bits of the read from the
+// anchor.
+inline bool aligned_resume_check(int64_t at, int64_t anchor, int64_t ck_grid, int64_t first_cut_from_anchor,
+                                 int64_t end_from_anchor, int64_t end_from_at, int64_t grid_now) {
+    if (anchor < 0 || ck_grid <= 0 || first_cut_from_anchor <= at || end_from_anchor != end_from_at) return false;
+    return grid_now == ck_grid && aligned_resume_ok(at, anchor, grid_now, end_from_anchor);
+}
+
 // The segment of a read that holds position p: from the last of the read's cuts at or before p (`start`, where the
 // read starts, when none) to the first after it (`last`, the last prompt token, when none).  Cuts outside (start, last)
 // (-1: absent) are ignored.  A cut AT p makes p the segment's start, so no aligned point lies before it in the segment.

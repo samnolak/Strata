@@ -11,9 +11,16 @@
 //   4. a later prompt (another segment end) that goes on from that checkpoint: whenever the guard accepts it
 //      (aligned_resume_ok and the same grid as the checkpoint's), its pieces are those of its own read from the
 //      anchor; and the guard does accept in the common case (the transcript grew a little);
-//   5. read_segment_of picks the segment a read cuts around the branch point.
+//   5. read_segment_of picks the segment a read cuts around the branch point;
+//   6. round 2 - the real functions the engine calls: read_turn_root against the inline code it replaced in generate.cpp
+//      (random prompts, every from / ckpt / tail-role / root case), aligned_resume_check (the branch_resume_ok rule),
+//      lm_plan_grid with the env knobs and the chunk the loan lays out (H2: a short lend's chunk, 2304, has no 24K grid),
+//      and ConversationCache::best with the usable filter.
+#include "strata/core/conversation_cache.hpp"
 #include "strata/prefill/lm_plan.hpp"
 #include "strata/program/slot_checkpoints.hpp"
+
+#include <random>
 
 #include <cstdint>
 #include <cstdio>
@@ -23,7 +30,9 @@
 namespace {
 using strata::prefill::lm_super_chunk;
 using strata::program::aligned_branch_boundary;
+using strata::program::aligned_resume_check;
 using strata::program::aligned_resume_ok;
+using strata::program::read_turn_root;
 using strata::program::read_segment_of;
 
 constexpr int64_t T = 8192;
@@ -164,6 +173,109 @@ int main() {
         expect(s.from == 24576 && s.end == 43370, "a read from an aligned checkpoint: its anchor");
         s = read_segment_of(43340, 30000, {2500, 43400}, 43378);
         expect(s.from == 30000 && s.end == 43378, "cuts outside (start, last) ignored");
+    }
+    // ---- 6a. read_turn_root == the inline code generate.cpp had (p55/final fea17c92, serve loop "turn_at" / "root_at")
+    {
+        auto old_code = [](const std::vector<int64_t>& ids, int64_t n, int64_t resume, int64_t read_from, bool resumed_from0,
+                           int req_ckpt, int64_t prompt_cache, int64_t turn_token, int64_t tail_role_token,
+                           int64_t prompt_cache_root) {
+            int64_t turn_at = -1;
+            if (prompt_cache > 0 && turn_token >= 0)
+                for (int64_t i = n - 1; i > resume; --i)
+                    if (ids[(size_t) i] == turn_token) { turn_at = i; break; }
+            if (turn_at > 0 && tail_role_token >= 0)
+                for (int64_t i = turn_at - 1; i > resume; --i)
+                    if (ids[(size_t) i] == turn_token) {
+                        if (ids[(size_t) i + 1] == tail_role_token) turn_at = i;
+                        break;
+                    }
+            const int64_t last_turn = turn_at;
+            if (!req_ckpt) turn_at = -1;
+            int64_t root_at = -1;
+            if (prompt_cache > 0 && turn_token >= 0 && prompt_cache_root > 0 && (read_from == 0 || resumed_from0))
+                for (int64_t i = 1; i < last_turn; ++i)
+                    if (ids[(size_t) i] == turn_token) {
+                        if (i >= prompt_cache_root) root_at = i;
+                        break;
+                    }
+            return std::make_pair(turn_at, root_at);
+        };
+        std::mt19937_64 rng(19);
+        const int64_t TT = 248045, ROLE = 77;
+        for (int it = 0; it < 20000; ++it) {
+            const int64_t n = 2 + (int64_t) (rng() % 300);
+            std::vector<int64_t> ids((size_t) n);
+            for (auto& x : ids) {
+                const uint64_t r = rng() % 100;
+                x = r < 6 ? TT : r < 10 ? ROLE : (int64_t) (rng() % 1000);
+            }
+            const int64_t resume = (int64_t) (rng() % (uint64_t) n), read_from = rng() % 3 == 0 ? 0 : resume;
+            const bool r0 = rng() % 4 == 0;
+            const int ck = (int) (rng() % 4 != 0);
+            const int64_t pc = rng() % 8 == 0 ? 0 : 12, tt = rng() % 16 == 0 ? -1 : TT;
+            const int64_t role = rng() % 2 ? ROLE : -1, root_min = (int64_t) (rng() % 4) * 40;
+            const auto want = old_code(ids, n, resume, read_from, r0, ck, pc, tt, role, root_min);
+            const auto got = read_turn_root(ids.data(), n, resume, read_from == 0 || r0, ck != 0, pc > 0, tt, role, root_min);
+            expect(got.turn == want.first && got.root == want.second, "read_turn_root == the code it replaced", it,
+                   got.turn, want.first);
+        }
+    }
+    // ---- 6b. aligned_resume_check: branch_resume_ok's rule
+    expect(aligned_resume_check(27528, 2952, 24576, 48740, 48740, 48740, 24576), "on the grid, the same segment and grid");
+    expect(!aligned_resume_check(27528, 2952, 24576, 52449, 52449, 52449, 32768), "the grid moved (24K -> 32K)");
+    expect(!aligned_resume_check(27528, 2952, 24576, 20000, 48740, 48740, 24576), "a cut of the read from the anchor before it");
+    expect(!aligned_resume_check(27528, 2952, 24576, 48740, 48740, 48000, 24576), "the read from it ends elsewhere");
+    expect(!aligned_resume_check(27529, 2952, 24576, 48740, 48740, 48740, 24576), "off the grid");
+    expect(!aligned_resume_check(27528, -1, 24576, 48740, 48740, 48740, 24576), "no anchor (a mark off the grid)");
+    expect(!aligned_resume_check(27528, 2952, 0, 48740, 48740, 48740, 24576), "no grid kept");
+    // ---- 6c. lm_plan_grid: the knobs and the loan's chunk (H2)
+    {
+        using strata::prefill::LmKnobs;
+        using strata::prefill::lm_plan_grid;
+        LmKnobs k;   // nothing set: the on-by-default 32K target, even split
+        expect(lm_plan_grid(45788, 8192, k) == 24576 && lm_plan_grid(27240, 8192, k) == 32768, "defaults at 8192");
+        expect(lm_plan_grid(45788, 2304, k) % 2304 == 0 && lm_plan_grid(45788, 2304, k) != 24576,
+               "a short lend's chunk (2304) gives another grid: the loan must be the segment's");
+        expect(lm_plan_grid(10000, 8192, k) == 0, "under two chunks: chunk-major");
+        k.tokens = 16384;
+        k.even = false;
+        expect(lm_plan_grid(45788, 8192, k) == 16384 && lm_plan_grid(10000, 8192, k) == 16384 &&
+                   lm_plan_grid(8191, 8192, k) == 0,
+               "LM_TOKENS=16384 LM_EVEN=0: a fixed 16K grid from one chunk on");
+        k = LmKnobs{};
+        k.explicit_on = true;   // STRATA_PREFILL_LAYER_MAJOR=1: the 8192 target
+        expect(lm_plan_grid(45788, 8192, k) == 16384, "LAYER_MAJOR=1: the 8192 target, two chunks minimum");
+        k = LmKnobs{};
+        k.force = true;
+        expect(lm_plan_grid(5000, 8192, k) == 8192, "LM_FORCE: any length");
+        expect(lm_plan_grid(45788, 0, LmKnobs{}) == 0, "no chunk: no grid");
+    }
+    // ---- 6d. ConversationCache::best with the usable filter (STRATA_BRANCH_CHECKPOINT_ALIGN)
+    {
+        using namespace strata::core;
+        ConversationCache cache(1 << 20, 4);
+        SavedConversation sv;
+        sv.live.ids = {1, 2, 3, 4, 5, 6, 7, 8};
+        sv.live.gdn.resize(64, 7);
+        sv.cvec = true;
+        ConversationCheckpoint c1, c2;
+        c1.ids = {1, 2, 3};
+        c1.gdn.resize(64, 1);
+        c2.ids = {1, 2, 3, 4, 5};
+        c2.gdn.resize(64, 2);
+        c2.branch = true;
+        c2.branch_anchor = 0;
+        c2.branch_grid = 0;   // (an off-grid branch checkpoint)
+        sv.checkpoints.push_back(c1);
+        sv.checkpoints.push_back(c2);
+        expect(cache.put(std::move(sv)), "park");
+        const std::vector<int64_t> prompt = {1, 2, 3, 4, 5, 9, 9};
+        expect(cache.best(prompt, {}, true).tokens == 5, "best: the branch checkpoint without a filter");
+        const auto m = cache.best(prompt, {}, true, [](const ConversationCheckpoint& c) { return !c.branch || c.branch_grid > 0; });
+        expect(m.tokens == 3 && !m.live, "best(usable): the filtered branch checkpoint left out");
+        expect(cache.best(std::vector<int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 1}, {}, true,
+                          [](const ConversationCheckpoint&) { return false; }).tokens == 8,
+               "best(usable): the parked live state always counts");
     }
     if (fails) {
         std::fprintf(stderr, "branch_align_test: %d of %d checks failed\n", fails, checks);

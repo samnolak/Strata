@@ -6431,9 +6431,10 @@ void Prefill::lm_release_chain() {
         if (p->impl_) p->lm_release();
 }
 
-int64_t Prefill::lm_plan_super_chunk(int64_t n) const {
+int64_t Prefill::lm_plan_super_chunk(int64_t n, int64_t chunk) const {
 #if defined(STRATA_GPU_METAL)
     (void) n;
+    (void) chunk;
     return 0;
 #else
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
@@ -6445,10 +6446,43 @@ int64_t Prefill::lm_plan_super_chunk(int64_t n) const {
     if (hand_in_ != nullptr || !impl_ || impl_->T <= 0 ||
         !strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026()))
         return 0;
-    const int64_t T = impl_->T;
-    const int64_t min_s = lm_force_env() ? 1 : (lm_tokens_env() > 0 ? T : 2 * T);
-    const int64_t want = lm_tokens_env() > 0 ? lm_tokens_env() : (!lm_env_explicit() ? kLmDefaultOnTokens : kLmDefaultTokens);
-    return lm_super_chunk(n, want, T, min_s, lm_even_env());
+    static_assert(kLmDefaultTokens == kLmPlanDefaultTokens && kLmDefaultOnTokens == kLmPlanDefaultOnTokens,
+                  "lm_plan.hpp mirrors the walk's targets");
+    LmKnobs k;
+    k.tokens = lm_tokens_env();
+    k.force = lm_force_env();
+    k.explicit_on = lm_env_explicit();
+    k.even = lm_even_env();
+    return lm_plan_grid(n, chunk > 0 ? chunk : impl_->T, k);
+#endif
+}
+
+int64_t Prefill::lm_probe(int64_t n, int64_t pin, std::string& why) {
+    why.clear();
+#if defined(STRATA_GPU_METAL)
+    (void) n;
+    (void) pin;
+    why = "Metal";
+    return 0;
+#else
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    constexpr bool lm_hip = true;
+#else
+    constexpr bool lm_hip = false;
+#endif
+    if (hand_in_ != nullptr || !impl_ ||
+        !strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026())) {
+        why = "the walk is off";
+        return 0;
+    }
+    const bool by_default = !lm_env_explicit();   // as run() sets it
+    for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
+    const int64_t pin0 = lm_pin_;
+    lm_pin_ = pin;
+    const int64_t s = lm_prepare_chain(n, why);
+    lm_pin_ = pin0;
+    lm_release_chain();
+    return s;
 #endif
 }
 
