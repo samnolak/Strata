@@ -45,6 +45,18 @@ inline int64_t free_mib_from(const char* v) {
     return n < 0 ? 4096 : (int64_t) n;
 }
 
+/// STRATA_IDLE_PARK_WATCHDOG_S: how long an idle park may go without a beat before the watchdog ends the engine (default
+/// 600 s, 10x the request watchdog's default: a restart costs far more than a slow park; it is an allowance on top of
+/// STRATA_WATCHDOG_S, see core/progress.hpp progress_allow); 0: an idle park is not watched (as before the review fix);
+/// negative or not a number: the default.
+inline int64_t watchdog_s_from(const char* v) {
+    if (v == nullptr || *v == '\0') return 600;
+    char* end = nullptr;
+    const long long n = std::strtoll(v, &end, 10);
+    if (end == v || n < 0) return 600;
+    return (int64_t) n;
+}
+
 /// Whether an idle park may start at all: the RAM available now (none read: no) leaves `floor_mib + free_mib` free.  The
 /// capture's own admission (its size against the same floor) follows; this only spares the work of sizing and splitting
 /// the image when the host has no room anyway.
