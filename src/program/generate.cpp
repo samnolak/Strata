@@ -85,6 +85,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/adapt_decay.hpp"
 #include "strata/program/batch_read.hpp"
+#include "strata/program/par_refill.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
@@ -14166,12 +14167,129 @@ int main(int argc, char** argv) {
         // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
         // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
         static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
+        // STRATA_REFILL_PAR=N (opt-in; unset / 0: off, the refill below exactly as before).  Every stage's lent slots
+        // at once, N threads per stage: each gathers its share of the blobs from the expert source (the GGUF mapping /
+        // page cache, or the drive) into its own 4 page-locked buffers and queues the copy from there on the stage's
+        // device - an asynchronous DMA, where a pageable source made each copy synchronous and the stages ran one after
+        // another (par_refill.hpp; E16).  A page-locked RAM copy's blobs go straight from it, as before.  The same
+        // bytes into the same slots; the host table is written once every copy is queued, before the waits below.
+        // Only the file-backed source (thread-safe copies; the stager already reads it from many threads), and not
+        // with STRATA_REFILL_PARTS / STRATA_REFILL_BLOCKING.  A failure says so once and refills serially from then on.
+        static const int refill_par = strata::program::par_refill_threads(std::getenv("STRATA_REFILL_PAR"));
+        static bool refill_par_off = false;
+        constexpr int kParRing = 4;
+        struct ParRing {
+            int dev = -1;
+            bool ok = false;
+            uint8_t* buf[kParRing] = {};
+            cudaEvent_t ev[kParRing] = {};
+        };
+        std::vector<ParRing> par_rings;                       // [part * refill_par + thread], made on first use
+        std::vector<std::unique_ptr<std::mutex>> par_mu;      // per part: one thread queues into its cache at a time
+        auto refill_par_run = [&](std::string& e) -> bool {
+            const size_t np = pf_parts.size();
+            const strata::kernels::cpu::ExpertLayout& play = strata::kernels::cpu::expert_layout();
+            std::vector<std::vector<strata::program::ParRefillItem>> items(np);
+            for (size_t k = 0; k < np; ++k) {
+                const PfPart& p = pf_parts[k];
+                if (p.lent.empty()) continue;
+                tr("refill start", (long long) p.lent.size());
+                items[k].reserve(p.lent.size());
+                for (const auto& [i, slot] : p.lent) {
+                    const int32_t l = (int32_t) (i / g.n_expert), x = (int32_t) (i % g.n_expert);
+                    items[k].push_back({l, x, slot, (int64_t) play.blob_bytes(l), srcp->pinned(l, x)});
+                }
+            }
+            int cur_dev = 0;
+            if (cudaGetDevice(&cur_dev) != cudaSuccess) { (void) cudaGetLastError(); cur_dev = 0; }
+            if (par_rings.size() < np * (size_t) refill_par) par_rings.resize(np * (size_t) refill_par);
+            while (par_mu.size() < np) par_mu.push_back(std::make_unique<std::mutex>());
+            std::mutex err_mu;
+            std::string first_err;
+            auto fail = [&](const std::string& why) {
+                std::lock_guard<std::mutex> lk(err_mu);
+                if (first_err.empty()) first_err = why;
+                return false;
+            };
+            auto ring_of = [&](int p, int t) -> ParRing& { return par_rings[(size_t) p * (size_t) refill_par + (size_t) t]; };
+            const size_t cap = (size_t) play.max_blob;
+            const bool ok = strata::program::par_refill_run(
+                items, refill_par, kParRing,
+                [&](int p, int t) {   // begin: the stage's device, this thread's ring (page-locked once, kept)
+                    strata::platform::name_this_thread("strata-refill");
+                    strata::aux_cpus::pin_current_thread();
+                    const int dev = pf_parts[(size_t) p].dev >= 0 ? pf_parts[(size_t) p].dev : cur_dev;
+                    if (cudaSetDevice(dev) != cudaSuccess) return fail("STRATA_REFILL_PAR: cudaSetDevice");
+                    ParRing& R = ring_of(p, t);
+                    if (R.ok) return R.dev == dev || fail("STRATA_REFILL_PAR: a stage moved to another device");
+                    R.dev = dev;
+                    for (int r = 0; r < kParRing; ++r) {
+                        if (R.buf[r] == nullptr && cudaHostAlloc((void**) &R.buf[r], cap, cudaHostAllocPortable) != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            R.buf[r] = nullptr;
+                            return fail("STRATA_REFILL_PAR: no page-locked RAM for the refill buffers");
+                        }
+                        if (R.ev[r] == nullptr && cudaEventCreateWithFlags(&R.ev[r], cudaEventDisableTiming) != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            R.ev[r] = nullptr;
+                            return fail("STRATA_REFILL_PAR: cudaEventCreate");
+                        }
+                    }
+                    R.ok = true;
+                    return true;
+                },
+                [&](int p, int t, int r) {   // wait: buffer r's previous copy has left it
+                    return cudaEventSynchronize(ring_of(p, t).ev[r]) == cudaSuccess ||
+                           fail(std::string("STRATA_REFILL_PAR: ") + cudaGetErrorString(cudaGetLastError()));
+                },
+                [&](int p, int t, int r, const strata::program::ParRefillItem& it) {   // gather (page cache / drive)
+                    return srcp->copy_blob(it.layer, it.expert, ring_of(p, t).buf[r]) ||
+                           fail("STRATA_REFILL_PAR: the expert source could not copy layer " + std::to_string(it.layer) +
+                                " expert " + std::to_string(it.expert));
+                },
+                [&](int p, int t, int r, const strata::program::ParRefillItem& it) {   // issue on the stage's stream 0
+                    const uint8_t* b = r < 0 ? srcp->blob_stable(it.layer, it.expert) : ring_of(p, t).buf[r];
+                    if (b == nullptr) return fail("STRATA_REFILL_PAR: no blob for a page-locked expert");
+                    std::string ce;
+                    std::lock_guard<std::mutex> lk(*par_mu[(size_t) p]);
+                    if (!pf_parts[(size_t) p].cache->fill_slot_queued(it.slot, b, ce, it.bytes)) return fail(ce);
+                    if (r >= 0 && cudaEventRecord(ring_of(p, t).ev[r], (cudaStream_t) 0) != cudaSuccess)
+                        return fail(std::string("STRATA_REFILL_PAR: ") + cudaGetErrorString(cudaGetLastError()));
+                    return true;
+                },
+                [&](int, int) {   // end: this thread's copies have landed (its buffers are free for the next refill)
+                    return cudaStreamSynchronize((cudaStream_t) 0) == cudaSuccess ||
+                           fail(std::string("STRATA_REFILL_PAR: ") + cudaGetErrorString(cudaGetLastError()));
+                });
+            if (!ok) {
+                e = first_err.empty() ? "STRATA_REFILL_PAR failed" : first_err;
+                return false;
+            }
+            for (size_t k = 0; k < np; ++k)
+                for (const auto& [i, slot] : pf_parts[k].lent) host_res[(size_t) i] = slot;
+            return true;
+        };
         auto refill = [&](std::string& e) -> bool {
             const auto t_rf = Clock::now();
             int64_t n_lent = 0, n_parts = 0;
             for (PfPart& p : pf_parts)
                 if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
-            if (n_parts > 1 && !refill_serial) {
+            bool par_done = false;
+            if (n_parts > 0 && refill_par > 0 && !refill_par_off && srcp == &src && !refill_parts && !refill_blocking()) {
+                std::string pe;
+                par_done = refill_par_run(pe);
+                if (!par_done) {
+                    // the serial refill below writes the same bytes into the same slots: a slot done twice is harmless
+                    refill_par_off = true;
+                    std::fprintf(stderr, "strata batch: WARNING: STRATA_REFILL_PAR=%d failed (%s); the lent slots are "
+                                         "refilled serially from now on\n", refill_par, pe.c_str());
+                    std::fflush(stderr);
+                }
+            }
+            if (par_done) {
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty() && !refill_wait(p, e)) return false;
+            } else if (n_parts > 1 && !refill_serial) {
                 for (PfPart& p : pf_parts)
                     if (!p.lent.empty() && !refill_issue(p, e)) return false;
                 for (PfPart& p : pf_parts)
@@ -14182,9 +14300,10 @@ int main(int argc, char** argv) {
             }
             if (n_parts > 0) res_upload();
             if (trace && n_parts > 0) {
-                std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
+                std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms%s\n",
                              (long long) n_lent, (long long) n_parts,
-                             std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+                             std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count(),
+                             par_done ? " (STRATA_REFILL_PAR: all stages at once)" : "");
                 std::fflush(stderr);
             }
             return true;
@@ -14254,6 +14373,12 @@ int main(int argc, char** argv) {
                                  "%lld ms for the next admission (the lent experts run on the CPU meanwhile)%s\n",
                          (long long) keep_loan_ms, (long long) keep_loan_ms,
                          pf_parts.empty() ? " - but the prompt path borrows no cache slots here" : "");
+        if (refill_par > 0)
+            std::fprintf(stderr, "strata serve: STRATA_REFILL_PAR=%d: the lent cache slots are refilled on every stage at once, "
+                                 "%d threads per stage gathering through page-locked buffers%s\n", refill_par, refill_par,
+                         srcp != &src ? " - but the expert source here is not the file-backed one (serial refill)"
+                         : refill_parts || refill_blocking() ? " - but STRATA_REFILL_PARTS / STRATA_REFILL_BLOCKING is set (serial refill)"
+                         : "");
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {

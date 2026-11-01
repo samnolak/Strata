@@ -211,6 +211,26 @@ inline bool stager_sleep() {
     }();
     return v;
 }
+// STRATA_SSD_TRACE=1 (opt-in diagnosis, E16): per prompt chunk and stage, how many expert blobs went through the
+// stager (page cache / drive -> page-locked ring) and how long the thread issuing the copies waited for them (the
+// gather) against the device ring (the compute) - the split that says what an --mmap-experts prompt read waits on.
+// Clock reads only; the same copies.
+inline bool ssd_trace() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_SSD_TRACE"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+// STRATA_WALK_PREFETCH=1 (opt-in, E16): the staged walk (a chunk below stream_all_min() tokens) hands the stager every
+// expert of the layer that is neither in the GPU cache nor page-locked when the layer starts (its attention half),
+// as the layer-major path does (STRATA_LM_PREFETCH), instead of the routed ones after the routing sync - the page-cache
+// or drive reads overlap the attention half and the router.  Above ~300 tokens nearly every expert is routed anyway;
+// the ones the routing skips are not read once nobody has claimed them (Stager::skip).  The same experts reach the
+// device in the same order, so the same bytes.  Not with a peer, the CPU share or KVA (their expert lists differ).
+// A chunk below 3 x n_expert / top-k tokens (153 on 512 experts, top-10: ~5% of the experts unrouted, e^-3) keeps the
+// routed-only list - a 20-token part would read 4x the bytes it needs; STRATA_WALK_PREFETCH=N > 1 sets that floor.
+inline int64_t walk_prefetch_env() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_WALK_PREFETCH"); return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0; }();
+    return v > 0 ? v : 0;
+}
 constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_slots(), at most ring_cap()
 // The chunk size from which every expert streams: 1024 since 0.1.30 (was 2048).  Measured on the 5070, Q2_0 / IQ2_XS,
 // fixed cache: 1,500-token prompts 621 -> 785 / 612 -> 735 tok/s, 2,000 727 -> 934 / 712 -> 892, 4,000 (its last
@@ -742,6 +762,8 @@ struct Stager {
 #endif
         }
     }
+    /// STRATA_SSD_TRACE: whether job j's copy is done already (a wait for it would return at once).
+    bool ready_now(int j) const { return ready[(size_t) j].load(std::memory_order_acquire) != 0; }
     /// Job j's bytes, in a pinned buffer (waits for the copy).
     const uint8_t* wait(int j) {
         while (!ready[(size_t) j].load(std::memory_order_acquire)) std::this_thread::yield();
@@ -986,6 +1008,66 @@ struct PrefillWarmer {
     }
 };
 
+// STRATA_SSD_AHEAD=1 (opt-in, E16; for a file tier the page cache does not hold - a model larger than the RAM, or several
+// models sharing it): when a layer split's stage starts a streamed chunk, the NEXT stage's streamed experts (every one
+// it holds neither in its GPU cache nor page-locked: a streamed chunk reads them all) are handed to the kernel as
+// madvise(WILLNEED) on this thread, so the drive reads them while this stage computes - the "LLM in a flash" /
+// ZeRO-Infinity overlap of the next block's reads with this block's work, with the stage order as the (exact)
+// predictor.  Only a hint: what the stager copies, and so the bytes, are unchanged.  The newest request replaces one not
+// yet started.  With the experts already in the page cache it only costs this thread's page-cache walk.
+struct SsdAhead {
+    core::ExpertSource* src = nullptr;
+    std::vector<std::pair<int32_t, int32_t>> pending;
+    bool has = false, quit = false;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::thread thread;
+    std::atomic<int64_t> posted{0}, advised{0}, skipped_warm{0};
+
+    explicit SsdAhead(core::ExpertSource* s) : src(s) {
+        thread = std::thread([this] {
+            strata::platform::name_this_thread("strata-ssd-ahead");
+            strata::aux_cpus::pin_current_thread();
+            for (;;) {
+                std::vector<std::pair<int32_t, int32_t>> job;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return quit || has; });
+                    if (quit) return;
+                    job.swap(pending);
+                    has = false;
+                }
+                // the page cache holding (a sample of) the file tier already: nothing to read ahead, skip the walk
+                // over every page of the stage's experts (it costs ~0.1 s of this thread per chunk for nothing)
+                if (src->cached_share(64) >= 0.99) { skipped_warm.fetch_add(1); continue; }
+                if (src->advise_pairs(job.data(), (int64_t) job.size())) advised.fetch_add((int64_t) job.size());
+            }
+        });
+    }
+    ~SsdAhead() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            quit = true;
+        }
+        cv.notify_all();
+        if (thread.joinable()) thread.join();
+    }
+    void post(std::vector<std::pair<int32_t, int32_t>>&& pairs) {
+        if (pairs.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            pending = std::move(pairs);
+            has = true;
+        }
+        posted.fetch_add(1);
+        cv.notify_one();
+    }
+};
+inline bool ssd_ahead_env() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_SSD_AHEAD"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+
 struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
@@ -1094,6 +1176,7 @@ struct Prefill::Impl {
     bool fused_bufs = false;
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
     std::unique_ptr<PrefillWarmer> warmer;   // STRATA_PREFILL_WARM=1: the per-layer walk's page warming
+    std::unique_ptr<SsdAhead> ssd_ahead;     // STRATA_SSD_AHEAD=1: the next stage's streamed experts, read ahead
     std::vector<std::vector<int64_t>> warm_prev;   // per layer: the file-tier experts of the previous chunk
     cudaEvent_t copied[RING_MAX] = {}, used[RING_MAX] = {};
     bool stage_live[RING_MAX] = {};
@@ -1653,6 +1736,15 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
         m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
+        if (ssd_trace()) {   // STRATA_SSD_TRACE: which copy profile this stage's prompt reads took (E16)
+            int npinned = 0;
+            for (char c : m.stager->pinned) npinned += c != 0;
+            std::fprintf(stderr, "strata prefill ssd: device %d: the stager copies unpinned experts on %d threads, ring %d (%d "
+                                 "page-locked), %d per claim (%s profile%s)%s\n", m.device, threads, m.stager->kRing, npinned,
+                         m.stager->batch, files ? "SSD" : "RAM", stv ? ", STRATA_STAGER_THREADS" : "",
+                         walk_prefetch_env() > 0 ? "; STRATA_WALK_PREFETCH: the staged walk starts each layer's copies with "
+                                               "its attention half" : "");
+        }
     }
     if (!m.warmer && src != nullptr && src->warms()) {
         const char* wv = std::getenv("STRATA_PREFILL_WARM");
@@ -3350,6 +3442,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         const bool ps_on = stream_all && m.pp && m.pp->ps_frac > 0.0;
         if (m.pp && !ps_on) m.pp->ps_flag.clear();
+        // STRATA_WALK_PREFETCH (E16): the staged walk's copies start with each layer (see walk_prefetch_env)
+        const int64_t walk_min = walk_prefetch_env() > 1 ? walk_prefetch_env() : 3 * (int64_t) m.g->n_expert / std::max<int64_t>(1, K);
+        const bool walk_pf = walk_prefetch_env() > 0 && T >= walk_min && !stream_all && m.src != nullptr && m.stager && !m.pp &&
+                             !kva_approx && !(cpu_pool_ != nullptr && cpu_share_on());
+        std::vector<int> walk_job;   // walk_pf: the layer's expert -> its stager job (-1: resident, pinned or none)
+        struct WalkPfStop {
+            Stager* st;
+            ~WalkPfStop() { if (st) st->finish(); }   // a return between a layer's start and its MoE half
+        } walk_pf_stop{walk_pf ? m.stager.get() : nullptr};
+        // STRATA_SSD_TRACE (E16): this chunk's staged blobs and the issuing thread's waits
+        const bool ssd_tr = ssd_trace();
+        const auto t_ssd0 = Clock::now();
+        int64_t ssd_staged = 0, ssd_pinned = 0, ssd_waits = 0;
+        uint64_t ssd_bytes = 0;
+        double ssd_wait_stager = 0.0, ssd_wait_ring = 0.0;
         // multi-GPU: the peer's ring - issue its copies up to `limit` / give entries back (the peer device is current)
         auto p_issue_until = [&](size_t limit) {
             PeerPrefill& P = *m.pp;
@@ -3425,6 +3532,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     seq.push_back({(int32_t) l, e, b, job});
+                    if (ssd_tr) {
+                        (job >= 0 ? ssd_staged : ssd_pinned) += 1;
+                        if (job >= 0) ssd_bytes += (uint64_t) lay0.blob_bytes(l);
+                    }
                 }
             }
             for (int64_t l = LE; l <= g.n_layers; ++l) {
@@ -3432,6 +3543,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
             }
             m.stager->start(std::move(js));
+            if (next_ != nullptr && next_->impl_ != nullptr && ssd_ahead_env()) {   // STRATA_SSD_AHEAD: the next stage's set
+                const Impl& nm = *next_->impl_;
+                const int64_t nb = std::max<int64_t>(0, next_->stage_lb_), ne = next_->stage_le_ < 0 ? g.n_layers : next_->stage_le_;
+                std::vector<std::pair<int32_t, int32_t>> pairs;
+                for (int64_t l = nb; l < ne; ++l)
+                    for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                        if (nm.host_res && nm.cache && nm.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                        if (m.src->pinned(l, e)) continue;
+                        pairs.emplace_back((int32_t) l, e);
+                    }
+                if (!m.ssd_ahead) m.ssd_ahead = std::make_unique<SsdAhead>(m.src);
+                if (ssd_tr)
+                    std::fprintf(stderr, "strata prefill ssd: layers [%lld,%lld): the next stage's %zu streamed experts "
+                                         "(layers [%lld,%lld)) read ahead (STRATA_SSD_AHEAD)\n", (long long) LB, (long long) LE,
+                                 pairs.size(), (long long) nb, (long long) ne);
+                m.ssd_ahead->post(std::move(pairs));
+            }
         }
         struct StagerDone {
             Stager* st;
@@ -3525,11 +3653,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // before the issuer waits: what it issued is covered, so no consumer waits on an entry with no event
                 auto cover = [&](size_t idx) { if (sparse_copied && idx > 0 && last_rec < (int64_t) idx - 1) record(idx - 1); };
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
+                    const auto tw = ssd_tr && idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring
+                                        ? Clock::now() : Clock::time_point{};
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
                         cover(idx);
                         if (a_stop.load(std::memory_order_acquire)) return;
                         std::this_thread::yield();
                     }
+                    if (tw != Clock::time_point{}) ssd_wait_ring += ms_since(tw);
                     const StreamEntry& en = seq[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
@@ -3556,7 +3687,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         ++iss_dma;
                     } else {
                         cover(idx);   // the stager may make the issuer wait
+                        const bool slow = ssd_tr && !m.stager->ready_now(en.job);
+                        const auto tg = slow ? Clock::now() : Clock::time_point{};
                         const uint8_t* hb = m.stager->wait(en.job);
+                        if (slow) { ssd_wait_stager += ms_since(tg); ++ssd_waits; }
                         cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                         m.stager->issued_one(en.job, m.copy);
                     }
@@ -3621,6 +3755,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         };
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
+            if (walk_pf) {   // STRATA_WALK_PREFETCH: this layer's streamed experts to the stager now, in id order
+                const int32_t NEx = (int32_t) m.g->n_expert;
+                walk_job.assign((size_t) NEx, -1);
+                std::vector<Stager::Job> js;
+                for (int32_t e = 0; e < NEx; ++e) {
+                    if (m.host_res && m.cache && m.host_res[(size_t) l * NEx + e] >= 0) continue;
+                    if (m.src->pinned(l, e)) continue;
+                    walk_job[(size_t) e] = (int) js.size();
+                    if (m.src->transient(l, e)) {
+                        js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
+                        continue;
+                    }
+                    const uint8_t* b = m.src->blob_stable(l, e);
+                    if (!b) { err = "prefill: expert source has no blob"; return false; }
+                    js.push_back({b, (size_t) lay0.blob_bytes(l)});
+                }
+                m.stager->finish();   // (the previous layer's MoE half finished its jobs; a layer without one did not)
+                m.stager->start(std::move(js));
+            }
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
@@ -5109,13 +5262,35 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::vector<int> stage_of(order.size(), -1);
                         // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
                         std::vector<int> job_of(order.size(), -1);
-                        if (!stream_all) {
+                        if (!stream_all && walk_pf) {
+                            // STRATA_WALK_PREFETCH: the stager has had the layer's streamed experts since the layer
+                            // began; the routed ones take their jobs (increasing with the id, as `order` is), and the
+                            // ones the routing skipped are not read if nobody has started them
+                            for (size_t j = 0; j < order.size(); ++j) {
+                                const int32_t e = order[j];
+                                if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                if (m.src->pinned(l, e)) continue;
+                                job_of[j] = walk_job[(size_t) e];
+                                if (job_of[j] < 0) { err = "prefill: STRATA_WALK_PREFETCH: a routed expert has no job"; return false; }
+                                if (ssd_tr) { ++ssd_staged; ssd_bytes += (uint64_t) lay.blob_bytes(l); }
+                            }
+                            for (int32_t e = 0; e < m.g->n_expert; ++e)
+                                if (m.cnt[(size_t) e] == 0 && walk_job[(size_t) e] >= 0) m.stager->skip(walk_job[(size_t) e]);
+                            if (m.warmer) {
+                                std::vector<int64_t> cur;
+                                for (size_t j = 0; j < order.size(); ++j)
+                                    if (job_of[j] >= 0) cur.push_back(order[j]);
+                                m.warm_prev[(size_t) l] = cur;
+                                m.warmer->submit(l, std::move(cur));
+                            }
+                        } else if (!stream_all) {
                             std::vector<Stager::Job> js;
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
+                                if (ssd_tr) { ++ssd_staged; ssd_bytes += (uint64_t) lay.blob_bytes(l); }
                                 if (m.src->transient(l, e)) {   // CS-T: copied by the source
                                     js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
                                     continue;
@@ -5159,9 +5334,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                                 cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                                 ++stats_.experts_dma;
+                                if (ssd_tr) ++ssd_pinned;
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
+                                if (walk_pf) m.stager->pass(job_of[j]);   // the skipped jobs below it get no DMA
+                                const bool slow = ssd_tr && !m.stager->ready_now(job_of[j]);
+                                const auto tg = slow ? Clock::now() : Clock::time_point{};
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
+                                if (slow) { ssd_wait_stager += ms_since(tg); ++ssd_waits; }
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                                 cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                                 m.stager->issued_one(job_of[j], m.copy);
@@ -5637,6 +5817,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (copy_wait_dedupe && pt.on)
                 std::fprintf(stderr, "strata prefill copies: %lld slot waits, %lld skipped as the same release event\n",
                              (long long) iss_waits, (long long) iss_dedup);
+        }
+        if (ssd_tr) {   // STRATA_SSD_TRACE (E16): what this chunk's expert stream waited on (host side, issue done)
+            const double wall = ms_since(t_ssd0);
+            std::fprintf(stderr, "strata prefill ssd: layers [%lld,%lld) %lld tokens (%s): %lld blobs through the stager (%.1f MB, "
+                                 "%.1f GB/s over the chunk), %lld from page-locked RAM; issue done after %.1f ms, waited %.1f ms "
+                                 "for the stager (%lld waits) and %.1f ms for the device ring\n",
+                         (long long) LB, (long long) LE, (long long) T,
+                         stream_all ? "streamed" : walk_pf ? "staged walk, prefetched per layer" : "staged walk",
+                         (long long) ssd_staged, (double) ssd_bytes / 1e6, wall > 0 ? (double) ssd_bytes / 1e6 / wall : 0.0,
+                         (long long) ssd_pinned, wall, ssd_wait_stager, (long long) ssd_waits, ssd_wait_ring);
         }
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
