@@ -6298,6 +6298,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
         why = "no VRAM for a super-chunk (" + std::to_string(free_b >> 20) + " MiB free)";
         return 0;
     }
+    if (lm_dry_) return s_use;   // lm_probe (N2): the size this VRAM takes, nothing allocated
     Impl::LmBufs& lb = m.lm;
     // pinned host: the routing's copy, the tables, and (host mode) the residual rows
     const size_t idsw = (size_t) (2 * s_use * K), tab = (size_t) lm_table_ints(s_use * K, G);
@@ -6476,12 +6477,16 @@ int64_t Prefill::lm_probe(int64_t n, int64_t pin, std::string& why) {
         return 0;
     }
     const bool by_default = !lm_env_explicit();   // as run() sets it
-    for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
+    for (Prefill* p = this; p != nullptr; p = p->next_) {
+        p->lm_by_default_ = by_default;
+        p->lm_dry_ = true;   // N2: sizes only (cudaMemGetInfo per stage), no cudaMalloc / cudaFree
+    }
     const int64_t pin0 = lm_pin_;
     lm_pin_ = pin;
     const int64_t s = lm_prepare_chain(n, why);
     lm_pin_ = pin0;
-    lm_release_chain();
+    for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_dry_ = false;
+    lm_release_chain();   // (nothing to free: a no-op unless a stage held buffers before)
     return s;
 #endif
 }

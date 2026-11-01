@@ -164,6 +164,7 @@ bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only,
 #include <map>
 #include <mutex>
 #include <optional>
+#include <tuple>
 #include <new>
 #include <charconv>
 #include <cmath>
@@ -2055,7 +2056,7 @@ public:
 private:
     static void clear_marks(ConvCheckpoint& c) {
         c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false; c.dev_tag = 0; c.branch = false;
-        c.mark = false; c.branch_anchor = -1; c.branch_grid = 0;
+        c.mark = false; c.branch_anchor = -1; c.branch_grid = 0; c.read_serial = 0;
         for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
     }
     bool on_;
@@ -10885,6 +10886,11 @@ int main(int argc, char** argv) {
         // request off the aligned way) and its pinned grid (0: the walk's own super-chunk, sp.last_super_chunk()) -
         // so a periodic mark taken on its grid is one an aligned read can go on from
         int64_t seg_al_anchor = -1, seg_al_grid = 0;
+        // N1: the read a checkpoint was saved in (ConversationCheckpoint::read_serial; one serial per prompt read) and
+        // the LRU stamp of the checkpoint checkpoint_at saved last (0: its last call saved none - one of that length was
+        // there already, or it failed)
+        int64_t ckpt_read_serial = 0;
+        uint64_t ckpt_new_used = 0;
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
@@ -11315,6 +11321,7 @@ int main(int argc, char** argv) {
         StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
             ckpt_why.clear();
+            ckpt_new_used = 0;
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
@@ -11440,6 +11447,8 @@ int main(int argc, char** argv) {
             } else if (L == tail_ckpt_len) {
                 tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
             }
+            c.read_serial = ckpt_read_serial;
+            ckpt_new_used = c.used;
             checks.push_back(std::move(c));
             const Clock::time_point te0 = Clock::now();
             const size_t before_evict = checks.size();
@@ -11535,6 +11544,7 @@ int main(int argc, char** argv) {
                 !sp.layer_major_mid();
             if (periodic_checkpoint || tail_checkpoint) {
                 bool saved = false;
+                ckpt_new_used = 0;   // (an incomplete set on a layer split calls no checkpoint_at)
                 if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk
                     std::vector<ConvCheckpoint> parts;
                     {
@@ -11552,9 +11562,10 @@ int main(int argc, char** argv) {
                 // STRATA_BRANCH_CHECKPOINT_ALIGN (M2; both paths, the layer split's too): a mark is a cut no read makes;
                 // an aligned read goes on from it only when it lies on the grid of its segment's read from the anchor
                 // (as for a branch checkpoint), else never.  (A mark at the end of a part becomes that cut's below.)
-                if (saved && branch_align_env())
+                // N1: only the checkpoint this call saved (not one of that length a read before saved, nor nothing)
+                if (saved && branch_align_env() && ckpt_new_used != 0)
                     for (ConvCheckpoint& k : checks)
-                        if ((int64_t) k.ids.size() == done && !k.branch) {
+                        if (k.used == ckpt_new_used && (int64_t) k.ids.size() == done && !k.branch) {
                             const int64_t S = seg_al_grid > 0 ? seg_al_grid : sp.last_super_chunk();
                             k.mark = true;
                             const bool on_grid = seg_al_anchor >= 0 && S > 0 && done > seg_al_anchor &&
@@ -15215,24 +15226,29 @@ int main(int argc, char** argv) {
             // for `tokens` (lend() below, without its side effects: the same want and the same #2090 halving); its own
             // buffers' chunk when it borrows nothing.  A loan still out that covers it keeps its larger chunk - the read
             // checks sp.chunk() after lend().
+            // lend()'s arithmetic, shared with it: the chunk a segment of `tokens` asks for (`exact` > 0: a planned
+            // segment read on, the loan it was read with), and what one participant lends for it (#2090: halved until
+            // its buffers fit the slots that can be lent) - {chunk, slots}
+            auto lend_want = [&](int64_t tokens, int64_t exact) -> int64_t {
+                const int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
+                const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
+                                       : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
+                                                                                     : want_full;
+                return exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+            };
+            auto lend_fit = [&](const PfPart& p, int64_t want) -> std::pair<int64_t, int64_t> {
+                int64_t want_p = want, need_p = part_slots(p, want_p);
+                while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
+                    want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
+                    need_p = part_slots(p, want_p);
+                }
+                return {want_p, need_p};
+            };
             auto seg_chunk = [&](int64_t tokens) -> int64_t {
                 if (pf_parts.empty() || tokens <= 0) return sp.chunk();
-                const int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
-                const int64_t want = o.prefill_head_alias ? o.prefill_chunk
-                                   : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
-                                                                                 : want_full;
-                for (const PfPart& p : pf_parts) {
-                    if (p.first < 0 || p.sp != &sp) continue;
-                    int64_t want_p = want;
-                    if (!o.prefill_head_alias) {
-                        int64_t need_p = part_slots(p, want_p);
-                        while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
-                            want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
-                            need_p = part_slots(p, want_p);
-                        }
-                    }
-                    return want_p;
-                }
+                const int64_t want = lend_want(tokens, 0);
+                for (const PfPart& p : pf_parts)
+                    if (p.first >= 0 && p.sp == &sp) return o.prefill_head_alias ? want : lend_fit(p, want).first;
                 return sp.chunk();
             };
             auto natural_end = [&](int64_t from, int64_t p) -> int64_t {
@@ -16189,14 +16205,10 @@ int main(int argc, char** argv) {
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
-                // prompt needs, so a large chunk costs a short prompt nothing
-                const int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
-                // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
-                const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
-                                       : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
-                                                                                     : want_full;
-                // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
-                const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+                // prompt needs, so a large chunk costs a short prompt nothing; #340: a short enough request reads in
+                // the stages' own S-token chunks (nothing lent); `exact`: a planned segment read on - the loan it was
+                // read with (what is left would size another).  (lend_want: the same for seg_chunk)
+                const int64_t want = lend_want(tokens, exact);
                 if (want <= 0) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
@@ -16221,11 +16233,8 @@ int main(int argc, char** argv) {
                         // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
                         // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
                         // lent even then is halved until it can, instead of ending the engine.
-                        int64_t need_p = part_slots(p, want_p);
-                        while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
-                            want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
-                            need_p = part_slots(p, want_p);
-                        }
+                        int64_t need_p = 0;
+                        std::tie(want_p, need_p) = lend_fit(p, want_p);   // (the same for seg_chunk)
                         if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
                             e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
                             return false;
@@ -17082,6 +17091,18 @@ int main(int argc, char** argv) {
                 if (rc == nullptr && lent_slot >= 0)
                     for (const ConvCheckpoint& c : bs[(size_t) lent_slot].checks)
                         if ((int64_t) c.ids.size() == resume && aligned_kind(c) && starts_with(c.ids, c.imgs)) { rc = &c; break; }
+                if (rc == nullptr && align_req) {   // H1: no checkpoint of that length is left to say what it was
+                    bool any = false;
+                    for (const ConvCheckpoint& c : checks) any = any || (int64_t) c.ids.size() == resume;
+                    if (lent_slot >= 0)
+                        for (const ConvCheckpoint& c : bs[(size_t) lent_slot].checks) any = any || (int64_t) c.ids.size() == resume;
+                    if (!any) {   // (a parked conversation whose checkpoints did not merge back, say)
+                        al_exact = false;
+                        std::fprintf(stderr, "strata serve: STRATA_BRANCH_CHECKPOINT_ALIGN: the checkpoint at %lld this read "
+                                             "goes on from is gone (its kind is not known): this read is not that read bit "
+                                             "for bit\n", (long long) resume);
+                    }
+                }
                 if (rc != nullptr && (align_req || rc->branch)) {   // (a mark for a request off the aligned way: as today)
                     if (!align_req || resumed_from0 || !branch_resume_ok(*rc)) {   // (the choice above leaves such out)
                         al_exact = false;
@@ -17158,6 +17179,7 @@ int main(int argc, char** argv) {
             if (pin_at >= 0 || branch_at >= 0)
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             int64_t at = read_from;
+            ++ckpt_read_serial;   // (N1: the checkpoints this read saves)
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
             // holds the last prompt token alone).  Only where every window row is the same in any window: a batch
@@ -17312,7 +17334,7 @@ int main(int argc, char** argv) {
                 if (branch_align_env() && to != branch_at &&
                     (to == turn_at || to == root_at || to == message_at || to == pin_at))
                     for (ConvCheckpoint& k : checks)   // the read's own cut: not a mark (on_chunk may have taken it there)
-                        if ((int64_t) k.ids.size() == to && !k.branch) {
+                        if ((int64_t) k.ids.size() == to && !k.branch && k.read_serial == ckpt_read_serial) {
                             k.mark = false;
                             k.branch_anchor = -1;
                             k.branch_grid = 0;
@@ -17320,6 +17342,11 @@ int main(int argc, char** argv) {
                 if (to == branch_at)   // marked: a slot that takes this conversation keeps it (slot_checkpoint_picks)
                     for (ConvCheckpoint& k : checks)
                         if ((int64_t) k.ids.size() == branch_at) {
+                            if (al_grid > 0 && k.read_serial != ckpt_read_serial) {   // N1: not this read's - left as it is
+                                std::fprintf(stderr, "strata serve: branch checkpoint at %lld: the checkpoint there is an "
+                                                     "earlier read's; not marked\n", (long long) branch_at);
+                                continue;
+                            }
                             if (al_grid > 0 && !al_exact) {
                                 // L3: the read did not run as planned - not a branch checkpoint (a slot would keep it as
                                 // its deepest), a mark no aligned read goes on from

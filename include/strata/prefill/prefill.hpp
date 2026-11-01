@@ -305,8 +305,9 @@ public:
     /// what a run did.
     int64_t lm_plan_super_chunk(int64_t n, int64_t chunk = 0) const;
     /// STRATA_BRANCH_CHECKPOINT_ALIGN: the super-chunk run() would read an n-token run in NOW (the walk's gate, every
-    /// stage's lm_prepare with this VRAM, the even split; with `pin` > 0 the pinned size), its buffers released again;
-    /// 0 when the walk would not take it (`why`).  Called after lend(), so the buffers' chunk is the run's.
+    /// stage's lm_prepare with this VRAM - its free memory, not an allocation -, the even split; with `pin` > 0 the pinned
+    /// size); 0 when the walk would not take it (`why`).  Called after lend(), so the buffers' chunk is the run's.  Not
+    /// checked: the pinned host RAM the run allocates (a run that cannot get it logs, see generate.cpp).
     int64_t lm_probe(int64_t n, int64_t pin, std::string& why);
     /// pin_super_chunk for a scope (reset on every way out)
     struct PinScope {
@@ -343,6 +344,7 @@ private:
     int64_t lm_pin_ = 0;           ///< pin_super_chunk (the first stage's)
     bool lm_pin_on_ = false;       ///< lm_prepare_chain: this stage is being sized at the pinned super-chunk
     int64_t lm_last_s_ = 0;        ///< last_super_chunk
+    bool lm_dry_ = false;          ///< lm_probe: lm_prepare sizes the super-chunk for this VRAM and allocates nothing
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
