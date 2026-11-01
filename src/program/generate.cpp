@@ -3265,7 +3265,15 @@ int main(int argc, char** argv) {
         else if (a == "--remote-expert-opt") o.remote_expert_opt = true;
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
-        else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
+        else if (a == "--vram-reserve-mib") {
+            o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
+            o.vram_reserve_given = true;
+            // p55/final2-c: a reserve is >= 0 MiB; -1 is Options::vram_reserve_flag_mib's "not overridden" (stage_reserve)
+            if (o.vram_reserve_mib < 0) {
+                std::fprintf(stderr, "--vram-reserve-mib %d: the reserve must be 0 MiB or more\n", o.vram_reserve_mib);
+                return 2;
+            }
+        }
         else if (a == "--vram-reserve-later-mib")
             o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
         else if (a == "--vram-reserve-per-dev") {
