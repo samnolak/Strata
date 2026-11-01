@@ -45,6 +45,9 @@ struct ConversationCheckpoint {
     // whose read did not run as planned - a cut no read makes, so an aligned read goes on from it only on the grid of
     // `branch_anchor` (-1: never).  Run-time only.
     bool mark = false;
+    // STRATA_BRANCH_CHECKPOINT_ALIGN: the prompt read that saved it (generate.cpp's per-read serial; a copy keeps it), so
+    // a read marks only the checkpoints it saved itself.  Run-time only.
+    int64_t read_serial = 0;
     // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
     // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
     // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
