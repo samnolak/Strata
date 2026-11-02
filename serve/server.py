@@ -83,6 +83,7 @@ from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import slot_policy  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
+from serve import toolcall_retry as tcr  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -379,7 +380,85 @@ try:
 except ValueError:
     SLOT_KEEP_MIN = 4096
 _MIRROR_LOCK = threading.Lock()
-STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
+# STRATA_FAIR_USERS=1 (opt-in, --batch; off: nothing below runs): the batch slots are shared fairly between USERS, not
+# between requests.  Every request first passes a gate that lets at most --batch requests into the engine; when a place
+# frees, the waiting request of the user with the FEWEST requests in the engine goes next (ties: the one served fewer
+# tokens - uncached prompt tokens / STRATA_FAIR_PREFILL_DIV + generated ones -, then STRATA_ADMIT_SHORT_FIRST's order,
+# then arrival).  A user's swarm of 8 agents then cannot hold every slot while another user's chat waits: the chat gets
+# the next free slot, and two swarms converge to half the slots each.  One user alone: the slots go in arrival order
+# (short first with STRATA_ADMIT_SHORT_FIRST), as before.  The user: the API key used when the server has several, else
+# the X-Strata-User header, the request's "user" (OpenAI) / "safety_identifier" / metadata.user_id (Anthropic; Claude
+# Code's session part is cut off), else a hash of the first STRATA_FAIR_PREFIX_TOKENS (4096) prompt tokens - one swarm on
+# one repository shares that start.  Client-given names are trusted: one key per user where that matters.
+# A request waiting STRATA_FAIR_MAX_WAIT_S (120) goes first whoever it belongs to.  No preemption: a slot is taken back
+# only when its request ends.  Also from the run config's "env" block (as the swarm options above).
+FAIR_USERS = (os.environ.get("STRATA_FAIR_USERS") or "0").strip() not in ("", "0")
+try:
+    FAIR_PREFIX_TOKENS = max(1, int(os.environ.get("STRATA_FAIR_PREFIX_TOKENS") or 4096))
+except ValueError:
+    FAIR_PREFIX_TOKENS = 4096
+try:
+    FAIR_PREFILL_DIV = max(1, int(os.environ.get("STRATA_FAIR_PREFILL_DIV") or 32))
+except ValueError:
+    FAIR_PREFILL_DIV = 32
+FAIR_MAX_WAIT_S = _timeout_env("STRATA_FAIR_MAX_WAIT_S", 120.0) or 0.0
+# STRATA_FAIR_RESERVE_S=<s> (opt-in, 0 = off): a user named by the client (not a prompt-start hash) whose last request
+# ended less than this ago keeps one free place: another user that already has a request in the engine does not take
+# the last free slot meanwhile, so an agent between two turns (its tools running) finds a slot at once.  Costs idle
+# slots while that user is away: a few seconds for agent swarms, never a human's typing time.
+FAIR_RESERVE_S = _timeout_env("STRATA_FAIR_RESERVE_S", 0.0) or 0.0
+FAIR_HEADER = "X-Strata-User"
+FAIR_USERS_KEPT = 256               # tenants remembered (served counts) at most; idle ones are dropped first
+
+
+def tenant_of(headers, req, api_key=None) -> str | None:
+    """STRATA_FAIR_USERS: who sends this request (None: nobody says - the engine then takes the prompt's start).  On a
+    server with SEVERAL API keys, the key the request came with ("k:<n>", its place in the list - a user cannot claim
+    another's share); else the X-Strata-User header (a proxy in front can set it), the body's "user" /
+    "safety_identifier" (OpenAI), metadata.user_id (Anthropic Messages).  Claude Code's user_id names the session too
+    ("user_<hash>_account_<uuid>_session_<uuid>", or a JSON object): one user is the account, not each session."""
+    def clean(v):
+        if not isinstance(v, str):
+            return None
+        v = v.strip()
+        return v[:128] or None
+    keys = key_list(api_key) if api_key else []
+    if len(keys) > 1 and headers is not None:
+        try:
+            auth = headers.get("Authorization", "") or ""
+            given = auth[7:].strip() if auth.lower().startswith("bearer ") else (headers.get("x-api-key", "") or "")
+        except Exception:   # noqa: BLE001
+            given = ""
+        for i, k in enumerate(keys):
+            if given and key_matches(given, k):
+                return f"k:{i + 1}"
+    try:
+        h = clean(headers.get(FAIR_HEADER)) if headers is not None else None
+    except Exception:   # noqa: BLE001 - a header object without get(): no user from it
+        h = None
+    if h:
+        return "u:" + h
+    if not isinstance(req, dict):
+        return None
+    for k in ("user", "safety_identifier"):
+        v = clean(req.get(k))
+        if v:
+            return "u:" + v
+    md = req.get("metadata")
+    uid = clean(md.get("user_id")) if isinstance(md, dict) else None
+    if not uid:
+        return None
+    if uid.startswith("{"):
+        try:
+            d = json.loads(uid)
+        except ValueError:
+            d = None
+        if isinstance(d, dict):
+            uid = clean(d.get("account_uuid")) or clean(d.get("device_id")) or clean(d.get("user_id")) or uid
+    return "u:" + uid.split("_session_", 1)[0]
+
+
+STALL_CPU_EPS_S = 0.5      # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
 
 
@@ -1289,6 +1368,10 @@ class StrataEngine:
         if self.batch and (self._uncached_on() or self._affinity_on()):
             print(f"[strata] swarm serving: admission by uncached length {'on' if self._uncached_on() else 'off'} "
                   f"(mirror {self._mirror_cap} streams), slot affinity {'on' if self._affinity_on() else 'off'}", flush=True)
+        if self._fair_on():
+            print(f"[strata] fair users: on ({self.batch} places shared between users; user = API key (several) / {FAIR_HEADER} header / "
+                  f"\"user\" / metadata.user_id, else the first {self._fair_prefix()} prompt tokens; max wait "
+                  f"{FAIR_MAX_WAIT_S:g} s; reserve {self._fair_reserve_s():g} s)", flush=True)
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
@@ -2091,6 +2174,13 @@ class StrataEngine:
         self._uncached_cfg, self._affinity_cfg = on("STRATA_ADMIT_UNCACHED"), on("STRATA_SLOT_AFFINITY")
         self._short_first_cfg = num("STRATA_ADMIT_SHORT_FIRST", 0) if self._uncached_cfg else 0
         self._keep_min_cfg = num("STRATA_SLOT_KEEP_MIN", SLOT_KEEP_MIN) if self._affinity_cfg else SLOT_KEEP_MIN
+        self._fair_cfg = on("STRATA_FAIR_USERS")
+        self._fair_prefix_cfg = max(1, num("STRATA_FAIR_PREFIX_TOKENS", FAIR_PREFIX_TOKENS)) if self._fair_cfg \
+            else FAIR_PREFIX_TOKENS
+        try:
+            self._fair_reserve_cfg = max(0.0, float(env.get("STRATA_FAIR_RESERVE_S") or 0)) if self._fair_cfg else 0.0
+        except (TypeError, ValueError):
+            self._fair_reserve_cfg = 0.0
 
     def _uncached_on(self) -> bool:
         return ADMIT_UNCACHED or self.__dict__.get("_uncached_cfg", False)
@@ -2978,6 +3068,187 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
+    # --- fair users (STRATA_FAIR_USERS; opt-in, see the flag) ---
+    def _fair_on(self) -> bool:
+        return bool(getattr(self, "batch", 0)) and (FAIR_USERS or bool(self.__dict__.get("_fair_cfg", False)))
+
+    def _fair_prefix(self) -> int:
+        return self.__dict__.get("_fair_prefix_cfg", FAIR_PREFIX_TOKENS)
+
+    def _fair_reserve_s(self) -> float:
+        return FAIR_RESERVE_S or self.__dict__.get("_fair_reserve_cfg", 0.0)
+
+    def _fair_state(self) -> dict:
+        """The gate's state (the caller holds slot_cv).  Made once and kept across engine restarts, as slot_cv: the
+        requests waiting in the gate hold it."""
+        f = self.__dict__.get("_fair")
+        if f is None:
+            f = self._fair = {"waiting": [], "inflight": {}, "total": 0, "served": {}, "admitted": {},
+                              "wait_max": {}, "order": collections.deque(maxlen=32), "overdue": 0,
+                              "idle_since": {}, "reserve_holds": 0}
+        return f
+
+    def _fair_tenant(self, ids) -> str:
+        """The user of this request: what the client said (tenant_of, through the request's thread), else a hash of
+        the prompt's first STRATA_FAIR_PREFIX_TOKENS tokens."""
+        t = getattr(self.__dict__.get("_tl"), "tenant", None)
+        if t:
+            return str(t)
+        head = list(ids[:self._fair_prefix()])
+        try:
+            raw = array("i", head).tobytes()
+        except (OverflowError, TypeError, ValueError):
+            raw = repr(head).encode()
+        return "p:" + hashlib.blake2b(raw, digest_size=6).hexdigest()
+
+    @staticmethod
+    def _fair_active(f) -> set:
+        return {t for t, n in f["inflight"].items() if n > 0} | {e["t"] for e in f["waiting"]}
+
+    def _fair_next(self, f, now):
+        """The waiting entry that goes into the engine next (the caller holds slot_cv): one that waited
+        STRATA_FAIR_MAX_WAIT_S first (the earliest); else the user with the fewest requests in the engine, then the
+        fewest tokens served; within a user STRATA_ADMIT_SHORT_FIRST's order (short or long-waiting first), then
+        arrival."""
+        w = f["waiting"]
+        if not w:
+            return None
+        if FAIR_MAX_WAIT_S:
+            overdue = [e for e in w if now - e["arr"] >= FAIR_MAX_WAIT_S]
+            if overdue:
+                return min(overdue, key=lambda e: e["arr"])
+        first = self._short_first()
+        inflight, served = f["inflight"], f["served"]
+        return min(w, key=lambda e: (inflight.get(e["t"], 0), served.get(e["t"], 0.0),
+                                     0 if not first or e["plen"] <= first or now - e["arr"] >= ADMIT_MAX_WAIT_S else 1,
+                                     e["arr"]))
+
+    def _fair_reserved(self, f, tenant, now) -> int:
+        """STRATA_FAIR_RESERVE_S: the free places kept for other users named by their clients whose last request ended
+        less than that ago (the caller holds slot_cv; at most all places but one)."""
+        rs = self._fair_reserve_s()
+        if not rs or not f["idle_since"]:
+            return 0
+        for t in [t for t, s in f["idle_since"].items() if now - s >= rs]:
+            f["idle_since"].pop(t, None)
+        return min(sum(1 for t in f["idle_since"] if t != tenant), max(1, int(self.batch)) - 1)
+
+    def _fair_room(self, f, entry, now) -> bool:
+        """A free place for `entry` (the caller holds slot_cv): one of the --batch places, and not one kept for another
+        user (STRATA_FAIR_RESERVE_S) - unless this user has nothing in the engine yet, or the entry waited
+        STRATA_FAIR_MAX_WAIT_S."""
+        free = max(1, int(self.batch)) - f["total"]
+        if free <= 0:
+            return False
+        if not f["inflight"].get(entry["t"]) or (FAIR_MAX_WAIT_S and now - entry["arr"] >= FAIR_MAX_WAIT_S):
+            return True
+        if free > self._fair_reserved(f, entry["t"], now):
+            return True
+        f["reserve_holds"] += 1
+        return False
+
+    def _fair_prune(self, f) -> None:
+        """Forget the served counts of idle users beyond FAIR_USERS_KEPT (the caller holds slot_cv)."""
+        if len(f["served"]) <= FAIR_USERS_KEPT:
+            return
+        active = self._fair_active(f)
+        for t in [t for t in f["served"] if t not in active][:len(f["served"]) - FAIR_USERS_KEPT]:
+            for k in ("served", "admitted", "wait_max"):
+                f[k].pop(t, None)
+
+    def _fair_generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        """STRATA_FAIR_USERS: generate_batched behind the gate.  At most --batch requests are in the engine (no more
+        can have a slot: the rest wait for one today too, in a race for the slot that frees); the one that goes next
+        is the one _fair_next picks.  Waiting here sends heartbeats (None) every 10 s, ends on the client's cancel,
+        the queue deadline (QueueWaitExpired) or a dead engine (EngineDied), as the wait for the control lines does."""
+        tenant = self._fair_tenant(ids)
+        plen = len(ids)
+        if self._uncached_on() and not embeddings and plen > 1:
+            try:                                        # what the engine will read (no estimate counted twice)
+                plen -= min(self._cache_hit(list(ids)), plen - 1)
+            except (OverflowError, TypeError, ValueError):
+                pass
+        entry = {"t": tenant, "arr": time.monotonic(), "plen": plen}
+        with self.slot_cv:
+            f = self._fair_state()
+            if tenant not in self._fair_active(f):
+                # a user coming back (or new) starts level with the least served active user: time away is no
+                # credit (it cannot take every slot for having been away), and its past is not held against it
+                act = [f["served"].get(t, 0.0) for t in self._fair_active(f)]
+                f["served"][tenant] = min(act) if act else 0.0
+            f["idle_since"].pop(tenant, None)
+            f["waiting"].append(entry)
+            self.slot_cv.notify_all()
+        beat, admitted = time.monotonic(), False
+        try:
+            while True:
+                deadline = getattr(cancel, "_strata_queue_deadline", None)
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                if not self.alive() and not getattr(self, "starting", False):
+                    raise EngineDied("the engine stopped while this request waited; it was not sent")
+                if cancel.is_set():
+                    return
+                with self.slot_cv:
+                    now = time.monotonic()
+                    if self._fair_next(f, now) is entry and self._fair_room(f, entry, now):
+                        if FAIR_MAX_WAIT_S and now - entry["arr"] >= FAIR_MAX_WAIT_S:
+                            f["overdue"] += 1
+                        f["waiting"] = [e for e in f["waiting"] if e is not entry]
+                        f["inflight"][tenant] = f["inflight"].get(tenant, 0) + 1
+                        f["total"] += 1
+                        f["served"][tenant] = f["served"].get(tenant, 0.0) + plen / FAIR_PREFILL_DIV
+                        f["admitted"][tenant] = f["admitted"].get(tenant, 0) + 1
+                        f["wait_max"][tenant] = max(f["wait_max"].get(tenant, 0.0), now - entry["arr"])
+                        f["order"].append(tenant)
+                        admitted = True
+                        break
+                    self.slot_cv.wait(timeout=0.5)
+                if time.monotonic() - beat >= 10.0:
+                    beat = time.monotonic()
+                    yield None
+        finally:
+            if not admitted:
+                with self.slot_cv:
+                    f["waiting"] = [e for e in f["waiting"] if e is not entry]
+                    self.slot_cv.notify_all()
+        inner = self.generate_batched(ids, max_new, sampling, cancel, embeddings)
+        made = 0
+        try:
+            for x in inner:
+                if x is not None:
+                    made += 1
+                yield x
+        finally:
+            inner.close()                               # (a consumer that stopped early: the slot is stopped now)
+            with self.slot_cv:
+                left = f["inflight"].get(tenant, 1) - 1
+                if left > 0:
+                    f["inflight"][tenant] = left
+                else:
+                    f["inflight"].pop(tenant, None)
+                f["total"] = max(0, f["total"] - 1)
+                f["served"][tenant] = f["served"].get(tenant, 0.0) + made
+                if self._fair_reserve_s() and tenant.startswith("u:") and tenant not in self._fair_active(f):
+                    f["idle_since"][tenant] = time.monotonic()
+                self._fair_prune(f)
+                self.slot_cv.notify_all()
+
+    def fair_view(self) -> dict | None:
+        """/metrics: the per-user gate (None: STRATA_FAIR_USERS off)."""
+        if not self._fair_on():
+            return None
+        with self.slot_cv:
+            f = self._fair_state()
+            names = set(f["inflight"]) | {e["t"] for e in f["waiting"]} | set(f["admitted"])
+            users = {t: {"inflight": f["inflight"].get(t, 0), "waiting": sum(1 for e in f["waiting"] if e["t"] == t),
+                         "admitted": f["admitted"].get(t, 0), "served": round(f["served"].get(t, 0.0)),
+                         "wait_max_s": round(f["wait_max"].get(t, 0.0), 2)} for t in sorted(names)}
+            return {"capacity": int(self.batch), "inflight": f["total"], "waiting": len(f["waiting"]),
+                    "overdue": f["overdue"], "prefix_tokens": self._fair_prefix(), "reserve_s": self._fair_reserve_s(),
+                    "reserved_for": sorted(f["idle_since"]), "reserve_holds": f["reserve_holds"], "users": users,
+                    "order": list(f["order"])}
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
@@ -2986,6 +3257,9 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
+            if self._fair_on():                         # STRATA_FAIR_USERS: behind the per-user gate
+                yield from self._fair_generate(ids, max_new, sampling, cancel, embeddings)
+                return
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
@@ -4834,6 +5108,15 @@ class Service:
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        # ctl55-robust (serve/toolcall_retry.py), all off by default: regenerate a turn that ends on a broken tool call,
+        # cap the thinking at a share of max_tokens, raise a small Anthropic max_tokens when the request thinks
+        self.toolcall_retry = tcr.env_int("STRATA_TOOLCALL_RETRY", 0)
+        self.toolcall_hold_calls = (os.environ.get("STRATA_TOOLCALL_RETRY_HOLD_CALLS") or "1").strip() != "0"
+        self.reasoning_cap_frac = tcr.env_frac("STRATA_REASONING_CAP_FRAC")
+        self.max_out_min = tcr.env_int("STRATA_MAX_OUT_MIN", 0)
+        if self.toolcall_retry or self.reasoning_cap_frac or self.max_out_min:
+            print(f"[strata] robust: STRATA_TOOLCALL_RETRY={self.toolcall_retry} (hold calls: {int(self.toolcall_hold_calls)}), "
+                  f"STRATA_REASONING_CAP_FRAC={self.reasoning_cap_frac}, STRATA_MAX_OUT_MIN={self.max_out_min}", flush=True)
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -5656,6 +5939,9 @@ class Service:
             swarm = self.engine.swarm_view() if hasattr(self.engine, "swarm_view") else None
             if swarm is not None:                       # opt-in swarm serving: the estimates against the engine's reuse
                 live["swarm"] = swarm
+            fair = self.engine.fair_view() if hasattr(self.engine, "fair_view") else None
+            if fair is not None:                        # opt-in STRATA_FAIR_USERS: the per-user gate
+                live["fair"] = fair
             if running and state == "idle":
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
@@ -5711,6 +5997,12 @@ class Service:
              t.get("tool_calls_unread", 0)),
             ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written",
              t.get("tool_args_repaired", 0)),
+            ("strata:tool_calls_malformed_total", "counter", "Turns that ended on broken tool-call markup (ctl55-robust)",
+             t.get("tool_calls_malformed", 0)),
+            ("strata:toolcall_retries_total", "counter", "Regenerations of a turn that ended on a broken tool call (STRATA_TOOLCALL_RETRY)",
+             t.get("toolcall_retries", 0)),
+            ("strata:toolcall_retry_ok_total", "counter", "Turns whose broken tool call a regeneration or a cut fixed",
+             t.get("toolcall_retry_ok", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
@@ -6173,13 +6465,34 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
-                                 recover=self.tool_call_recovery, declared_only=declared_only)
+        cap_by_frac = False
+        if thinking and self.reasoning_cap_frac and max_new and max_new > 0:
+            # ctl55-robust (STRATA_REASONING_CAP_FRAC): the thinking may use at most this share of max_tokens, whatever
+            # the budget says; it only lowers the cap (the wrap-up below closes the thinking there)
+            cap = max(1, int(max_new * self.reasoning_cap_frac))
+            if not budget or budget > cap:
+                print(f"[strata] thinking capped at {cap} of max_tokens {max_new} (STRATA_REASONING_CAP_FRAC="
+                      f"{self.reasoning_cap_frac}; budget {budget})", flush=True)
+                budget, cap_by_frac = cap, True
+        ptools = with_history_tools(tools, sampling)
+
+        def new_parser():
+            return self.parser_cls(thinking=thinking, tools=ptools, stream_tools=True,
+                                   recover=self.tool_call_recovery, declared_only=declared_only)
+        parser = new_parser()
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
+        # ctl55-robust (STRATA_TOOLCALL_RETRY): the answer's events are held where tool-call markup may start, and a
+        # turn that ends on a broken call is regenerated from the token before it (serve/toolcall_retry.py).  Off (the
+        # default) the hold passes every event through at once and only keeps the account for the metrics.
+        tc_on = bool(self.toolcall_retry and self.parser_cls is OutputParser and getattr(parser, "schemas", None)
+                     and stops is None and not force)
+        hold = tcr.Hold(tc_on, self.toolcall_hold_calls)
+        tape = tcr.Tape(ids, None if thinking else 0) if tc_on else None
+        tc_tries, tc_cuts, tc_dropped, tc_seen, tc_keys = 0, 0, 0, [], set()
 
         def cut(evs):
             """The events with the answer's text cut at a stop string (OpenAI stop, Anthropic stop_sequences)."""
@@ -6226,6 +6539,7 @@ class Service:
             context = self.engine.__dict__.setdefault("_tl", threading.local())
             context.peer_ip = peer_ip
             context.api_request_key = api_request_key
+            context.tenant = getattr(self.request_trace, "tenant", None)   # STRATA_FAIR_USERS: who sends it
             context.cache_debug = None
             context.executed_slot = None
             context.cache_source_slot = None
@@ -6377,6 +6691,10 @@ class Service:
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
+                                if tape is not None:
+                                    tape.add(t, piece, n)
+                                    if tape.answer_at is None and parser.state == "content":
+                                        tape.answer_at = tape.size - len(parser.buf)
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
@@ -6384,6 +6702,8 @@ class Service:
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
+                                evs = hold.push(evs, tape.size - len(parser.buf) if tape is not None else None)
+                                for ev in evs:
                                     yield "event", ev
                                 if evs:
                                     last_out = time.perf_counter()
@@ -6481,6 +6801,8 @@ class Service:
                                              for k in ("temperature", "presence_penalty")):
                                 sampling = {**(sampling or {}), "temperature": want[0], "presence_penalty": want[1]}
                             prompt = recover_prompt
+                            if tape is not None:
+                                tape.new_pass(prompt)
                             with self.status_lock:
                                 st["reasoning_recoveries"] = recovery_count
                             if trace is not None:
@@ -6490,6 +6812,73 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
+                        if (tape is not None and finish == "stop" and not wrap and not opens and not cancel.is_set()
+                                and (stops is None or stops.hit is None)):
+                            # ctl55-robust (STRATA_TOOLCALL_RETRY): the turn ended on a broken tool call.  Go back to
+                            # the token before it (replaying the kept tokens rebuilds the parser and the detokenizer;
+                            # what was sent stays as sent) and write the template's opener there (a call), or end the
+                            # turn there (a chat-control token that does not start a call).
+                            fix = tcr.broken_at(parser, tape, hold)
+                            if fix is not None:
+                                tc_seen.append(fix[2])
+                                pos, kind, snippet = fix
+                                k = tape.token_before(pos)
+                                seed = (sampling or {}).get("seed")
+                                seeded = isinstance(seed, int) and not isinstance(seed, bool) and seed > 0
+                                key = (k, hash(tuple(tape.ids[:k])))
+                                if kind == "call" and tape.text.startswith(tcr.OPENER, pos):
+                                    tc_keys.add(key)        # the opener was already the template's: same prefix
+                                temp = (sampling or {}).get("temperature")
+                                greedy = (isinstance(temp, (int, float)) and temp <= 0) or (sampling or {}).get("top_k") == 1
+                                if kind == "call" and (tc_tries >= self.toolcall_retry
+                                                       or (key in tc_keys and greedy and not seeded)):
+                                    fix = None              # spent, or the same greedy prefix again: left as it is
+                            if fix is not None:
+                                opener = self.tok.encode(tcr.OPENER, parse_special=True) if kind == "call" else []
+                                n_at = tape.ns[k - 1] if k else 0
+                                rp = tcr.replay(new_parser, Detokenizer, self.tok, tape.ids[:k], hold) \
+                                    if max_new - n_at - len(opener) >= 1 else None
+                                if rp is None:
+                                    print(f"[strata] the reply ended on a broken tool call ({snippet!r}); it cannot be "
+                                          "regenerated here (what was already sent does not match a replay, or no room "
+                                          "is left): sent as it is (STRATA_TOOLCALL_RETRY)", flush=True)
+                                else:
+                                    tc_dropped += n - n_at
+                                    hold.discard()
+                                    parser, detok, evs, tail = rp
+                                    prompt = tape.prompt_at(k)
+                                    tape.cut(k)
+                                    n, run_tok, run_len = n_at, None, 0
+                                    if tape.answer_at is None and parser.state == "content":
+                                        tape.answer_at = tape.size - len(parser.buf)
+                                    for ev in hold.push(evs, tape.size - len(parser.buf)):
+                                        yield "event", ev
+                                    if kind == "control":
+                                        tc_cuts += 1
+                                        print(f"[strata] the answer wrote a chat-control token ({snippet!r}): the turn "
+                                              "ends before it (STRATA_TOOLCALL_RETRY)", flush=True)
+                                        break
+                                    tc_tries += 1
+                                    if key in tc_keys and seeded:
+                                        sampling = {**sampling, "seed": seed + tc_tries}
+                                    tc_keys.add(key)
+                                    print(f"[strata] the reply ended on a broken tool call ({snippet!r}): regenerating "
+                                          f"from the token before it with the template's opener (STRATA_TOOLCALL_RETRY, "
+                                          f"attempt {tc_tries} of {self.toolcall_retry})", flush=True)
+                                    for t in opener:
+                                        n += 1
+                                        raw_ids.append(t)
+                                        piece = detok.push(t)
+                                        evs = parser.feed(piece)
+                                        tape.add(t, piece, n)
+                                        self._note(n, evs, st, rate)
+                                        for ev in hold.push(evs, tape.size - len(parser.buf)):
+                                            yield "event", ev
+                                    tail = (tail + tcr.OPENER)[-2:]
+                                    prompt = prompt + opener
+                                    tape.new_pass(prompt)
+                                    finish = "length"
+                                    continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
                                 and parser.buf != THINK_END         # #537: not after a held </think>, the end
@@ -6505,11 +6894,18 @@ class Service:
                                     n += 1
                                     raw_ids.append(t)
                                     thinking_n += parser.state in ("reasoning", "rcall")
-                                    evs = cut(parser.feed(detok.push(t)))
+                                    piece = detok.push(t)
+                                    evs = cut(parser.feed(piece))
+                                    if tape is not None:
+                                        tape.add(t, piece, n)
+                                        if tape.answer_at is None and parser.state == "content":
+                                            tape.answer_at = tape.size - len(parser.buf)
                                     self._note(n, evs, st, rate)
-                                    for ev in evs:
+                                    for ev in hold.push(evs, tape.size - len(parser.buf) if tape is not None else None):
                                         yield "event", ev
                                 prompt = prompt + seg + extra
+                                if tape is not None:
+                                    tape.new_pass(prompt)
                                 finish = "length"
                                 continue
                         if not (wrap or opens) or cancel.is_set():
@@ -6531,18 +6927,28 @@ class Service:
                         if wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
+                            if cap_by_frac:
+                                with self.status_lock:
+                                    self.totals["reasoning_cap_hits"] = self.totals.get("reasoning_cap_hits", 0) + 1
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
-                            evs = cut(parser.feed(detok.push(t)))
+                            piece = detok.push(t)
+                            evs = cut(parser.feed(piece))
+                            if tape is not None:
+                                tape.add(t, piece, n)
+                                if tape.answer_at is None and parser.state == "content":
+                                    tape.answer_at = tape.size - len(parser.buf)
                             self._note(n, evs, st, rate)
-                            for ev in evs:
+                            for ev in hold.push(evs, tape.size - len(parser.buf) if tape is not None else None):
                                 yield "event", ev
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
                         prompt = prompt + seg + extra
+                        if tape is not None:
+                            tape.new_pass(prompt)
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:
@@ -6598,6 +7004,8 @@ class Service:
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
+                            if tape is not None:            # ctl55-robust: this request's tool-call regenerations
+                                self.history[-1]["toolcall_retries"] = tc_tries
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen
@@ -6666,7 +7074,10 @@ class Service:
                 self._terminal_event_locked(request_id, event, finish)
             if emb:
                 Path(emb).unlink(missing_ok=True)
-        for ev in cut(parser.finish(finish)):
+        in_call = parser.state in ("call", "json")
+        fin = cut(parser.finish(finish))
+        unterminated = finish == "stop" and in_call and not any(ev.kind == "tool_call" for ev in fin)
+        for ev in hold.push(fin) + hold.flush():
             yield "event", ev
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
@@ -6691,6 +7102,37 @@ class Service:
                 self.totals["tool_calls_unread"] = self.totals.get("tool_calls_unread", 0) + parser.unread
             # #3796: the same names for the client (a machine-readable marker next to the text, which stays as the model wrote it)
             rejected = [{"name": nm, "reason": "undeclared"} for nm in named or []]
+        # ctl55-robust: a turn that ended (a natural stop) on broken tool-call markup and no call - or inside a call - is
+        # counted in /metrics (tool_calls_malformed) with or without STRATA_TOOLCALL_RETRY; with it, the response also
+        # marks it in strata_rejected_tool_calls (reason "malformed") when the retries could not fix it
+        still = None
+        if (self.parser_cls is OutputParser and getattr(parser, "schemas", None) and finish == "stop"
+                and (stops is None or stops.hit is None)):
+            found = tcr.call_markup(hold.content()) if not hold.calls else None
+            still = "unterminated call" if unterminated else (found[2] if found else None)
+        if still or tc_seen or tc_tries or tc_cuts:
+            with self.status_lock:
+                t = self.totals
+                if still or tc_seen:
+                    t["tool_calls_malformed"] = t.get("tool_calls_malformed", 0) + 1
+                if tc_tries:
+                    t["toolcall_retries"] = t.get("toolcall_retries", 0) + tc_tries
+                if (tc_tries or tc_cuts) and not still:
+                    t["toolcall_retry_ok"] = t.get("toolcall_retry_ok", 0) + 1
+                if tc_dropped:
+                    t["toolcall_retry_tokens"] = t.get("toolcall_retry_tokens", 0) + tc_dropped
+                if tc_cuts:
+                    t["toolcall_cuts"] = t.get("toolcall_cuts", 0) + tc_cuts
+        if still:
+            print(f"[strata] the reply ended on a broken tool call ({still!r}) and goes out as it is"
+                  + (f" after {tc_tries} regeneration(s)" if tc_tries else "")
+                  + ("" if self.toolcall_retry else " (STRATA_TOOLCALL_RETRY=N regenerates such endings)")
+                  + "; /metrics counts it as tool_calls_malformed", flush=True)
+            if self.toolcall_retry:
+                rejected.append({"name": "", "reason": "malformed", "markup": still[:80]})
+        elif tc_tries or tc_cuts:
+            print(f"[strata] the broken tool call was fixed ({tc_tries} regeneration(s), {tc_cuts} cut(s), "
+                  f"{tc_dropped} generated tokens dropped)", flush=True)
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
@@ -8197,6 +8639,7 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     svc.request_trace.peer_ip = self.client_address[0]
+                    svc.request_trace.tenant = tenant_of(self.headers, req, svc.api_key)   # STRATA_FAIR_USERS (unused when off)
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -8269,6 +8712,7 @@ def make_handler(svc: Service):
                 if reserved:
                     svc.release_inference()
                 svc.request_trace.peer_ip = None
+                svc.request_trace.tenant = None
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
@@ -8791,6 +9235,12 @@ def make_handler(svc: Service):
                 tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))        # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            if svc.max_out_min and 0 < max_new < svc.max_out_min and kw.get("enable_thinking", True) is not False:
+                # ctl55-robust (STRATA_MAX_OUT_MIN): the thinking counts in max_tokens; a small one left no room to answer.
+                # NOTE: usage.output_tokens can then be more than the request's max_tokens (prepare still fits the context)
+                print(f"[strata] max_tokens {max_new} raised to {svc.max_out_min} for a thinking request "
+                      "(STRATA_MAX_OUT_MIN)", flush=True)
+                max_new = svc.max_out_min
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type

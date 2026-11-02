@@ -1124,6 +1124,13 @@ class OutputParser:
         for name in self.schemas:
             if isinstance(name, str) and "__" in name:
                 aliases.setdefault(name.replace("__", "_"), set()).add(name)
+        # A client that escapes its tool names on the wire (omp / oh-my-pi with the Claude Code identity on an
+        # anthropic-messages provider, or `escapeBuiltinToolNames`: `_read`, `_bash`, `_write`) still names them
+        # unprefixed in its system prompt (`read`, `bash`, `write`), and the model writes those.  The name without
+        # its leading underscores is that tool when exactly one declared tool has it (an exactly declared name wins).
+        for name in self.schemas:
+            if isinstance(name, str) and name.startswith("_") and name.lstrip("_"):
+                aliases.setdefault(name.lstrip("_"), set()).add(name)
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
