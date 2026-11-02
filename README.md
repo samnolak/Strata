@@ -1,3 +1,6 @@
+> **Fork:** this is `samnolak/Strata`, branch `linux-multigpu` — upstream Strata v0.2.9 plus opt-in multi-GPU / SSD-offload
+> changes for 4× RTX 4080 on Linux. What differs: [FORK.md](FORK.md). Upstream: [Niko1221/Strata](https://github.com/Niko1221/Strata).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
